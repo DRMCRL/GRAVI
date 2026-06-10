@@ -1,0 +1,26 @@
+## Plot colours propagated through all markdown documents for
+## consistency. Treat colours must match all treatments specified in config.yml
+## with the addition of a colour for input/control samples
+qc:
+  pass: "#0571B0"
+  fail: "#CA0020"
+regions:
+  promoter: '#FF3300'
+  upstream_promoter: '#E1EE05'
+  exon: '#7EDD57'
+  intron: '#006600'
+  proximal_intergenic: '#000066'
+  distal_intergenic: '#551A8B'
+treat:
+  Input: "#33333380"
+  Control: "#3333CC"
+  Treat: "#C52240"
+features:
+  enhancer: "#FFFF00"
+  no_feature: "#E5E5E5"
+direction:
+  up: "#CA0020"
+  down: "#0571B0"
+  unchanged: "#7F7F7F"
+  undetected: "#E5E5E5"
+heatmaps: ['white', 'red']

@@ -1,0 +1,38 @@
+## Please see https://smped.github.io/GRAVI/editing-yaml.html for a description of this file
+samples:
+  file: "config/samples.tsv"
+
+paths:
+  bam: "data/bam"
+
+comparisons:
+  method: "sq-lt"
+  fc: 1.2
+  fdr: 0.05
+  paired: false
+  filter_q: 0.6
+  contrasts:
+    - ["E2", "E2DHT"]
+  ihw: "targets"
+
+genome:
+  build: "GRCh37"
+
+external:
+  blacklist:
+  gtf:
+  rnaseq:
+  features:
+  hic:
+  coverage:
+
+peaks:
+  macs2:
+    gsize: "hs"
+    fdr: 0.05
+    keep_duplicates: "all"
+  qc:
+    outlier_threshold: 10
+    allow_zero: true
+    min_prop_reps: 0.5
+
