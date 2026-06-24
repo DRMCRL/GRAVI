@@ -24,3 +24,4 @@
 # New bugs
 - High core setup crashes space allowance on Slurm
 - If running snakemake via Slurm from the beginning (ie no custom conda envs pre-made), conda env creation sometimes fails due to connection issues
+- Pairwise comparison html file not incorporated in overall report with other html files (ie no hyperlink/tab for it)
