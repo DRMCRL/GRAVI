@@ -9,7 +9,7 @@ paths:
 comparisons:
   method: "sq-lt"
   fc: 1
-  fdr: 0.05
+  fdr: 0.999
   paired: false
   filter_q: 0.6
   contrasts:

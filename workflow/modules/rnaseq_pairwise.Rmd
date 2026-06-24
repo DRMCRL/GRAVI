@@ -5,6 +5,8 @@ library(fgsea)
 library(patchwork)
 library(metap)
 id2gene <- structure(gtf_gene$gene_name, names = gtf_gene$gene_id)
+# Thao added the following line to make a DE col in rnaseq containing logical vals for DEG (diff analysis originally done via DESEq2 which d$
+rnaseq$DE <- rnaseq[, rna_fdr_col][[1]] < 0.05
 rna_status <- rnaseq %>% 
   mutate(
     de_status = case_when(

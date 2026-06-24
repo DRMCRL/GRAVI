@@ -1,3 +1,15 @@
+*.pdf
+workflow_validated_firstrun/*
+output_sq/*
+output_gr_sq_rerun/*
+output_ar_gr_sq/*
+output/*
+docs_sq/*
+docs_gr_sq_rerun/*
+docs_ar_gr_sq/*
+slurm*
+analysis/*
+docs/*
 .Rproj.user
 .Rhistory
 *.RData

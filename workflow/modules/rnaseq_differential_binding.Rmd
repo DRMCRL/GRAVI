@@ -3,12 +3,15 @@
 ```{r define-objects}
 library(fgsea)
 library(metap)
+# Thao added the following line to make a DE col in rnaseq containing logical vals for DEG (diff analysis originally done via DESEq2 which doesnt have this col, is this an edgeR thing?
+rnaseq$DE <- rnaseq[, rna_fdr_col][[1]] < 0.05
+# back to og script
 rna_status <- rnaseq %>% 
   mutate(
     de_status = case_when(
-      !!sym(rna_fdr_col) < fdr_alpha & !!sym(rna_lfc_col) < 0 ~ "Down",
-      !!sym(rna_fdr_col) < fdr_alpha & !!sym(rna_lfc_col) > 0 ~ "Up",
-      !!sym(rna_fdr_col) >= fdr_alpha ~ "Unchanged"
+      !!sym(rna_fdr_col) < 0.05 & !!sym(rna_lfc_col) < 0 ~ "Down", #0.05 replacing fdr_alpha
+      !!sym(rna_fdr_col) < 0.05 & !!sym(rna_lfc_col) > 0 ~ "Up",#0.05 replacing fdr_alpha
+      !!sym(rna_fdr_col) >= 0.05 ~ "Unchanged" #0.05 replacing fdr_alpha
     )
   ) %>% 
   dplyr::select(gene_id, gene_name, de_status) %>% 
@@ -188,6 +191,12 @@ if (has_features) {
 ### DE Genes Associated with Changed `r target` Binding
 
 ```{r any_diff_sites}
+##TEST SCRIPT ONLY!!!
+#unadjusted pval and threshold adjusted FOR TESTING ONLY to give a more manageable number of peaks to run on
+# in actual run DO NOT USE THE FOLLOWING 2 LINES
+#fdr_column <- "P.Value"
+#fdr_alpha <- 0.05
+# back to actual script
 de_genes_db_regions <- tibble()
 any_diff_sites <- sum(mcols(merged_results)[[fdr_column]] < fdr_alpha) > 0
 any_de <- any(rnaseq$DE)
@@ -237,7 +246,7 @@ if (any_de & any_diff_sites) {
 
 ```{r de-genes-db-regions, eval = any_diff_sites, echo = any_diff_sites}
 cmn_genes <- intersect(
-  rnaseq %>% dplyr::filter(!!sym(rna_fdr_col) < fdr_alpha) %>% pull("gene_id"),
+  rnaseq %>% dplyr::filter(!!sym(rna_fdr_col) < 0.05) %>% pull("gene_id"), #0.05 replacing fdr_alpha
   merged_results %>% 
     filter(!!sym(fdr_column) < fdr_alpha) %>% 
     as_tibble() %>% 
@@ -2063,7 +2072,7 @@ plotHFGC(
   annotation = annot,
   annotcol = colours$direction %>%
     setNames(str_to_title(names(.))),
-  cytobands = bands_df,
+  #cytobands = bands_df,
   collapseTranscripts = ct, # Set this as a function of n_transcripts
   zoom = 1.1,
   fontsize = 10,
@@ -2104,7 +2113,7 @@ plotHFGC(
   annotation = annot,
   annotcol = colours$direction %>%
     setNames(str_to_title(names(.))),
-  cytobands = bands_df,
+  #cytobands = bands_df,
   collapseTranscripts = ct, # Set this as a function of n_transcripts
   zoom = 1.1,
   max = width(grl_to_plot[[i]]),
@@ -2145,7 +2154,7 @@ plotHFGC(
   annotation = annot,
   annotcol = colours$direction %>%
     setNames(str_to_title(names(.))),
-  cytobands = bands_df,
+  #cytobands = bands_df,
   collapseTranscripts = ct, # Set this as a function of n_transcripts
   zoom = 1.1,
   max = width(grl_to_plot[[i]]),
@@ -2186,7 +2195,7 @@ plotHFGC(
   annotation = annot,
   annotcol = colours$direction %>%
     setNames(str_to_title(names(.))),
-  cytobands = bands_df,
+  #cytobands = bands_df,
   collapseTranscripts = ct, # Set this as a function of n_transcripts
   zoom = 1.1,
   max = width(grl_to_plot[[i]]),
@@ -2227,7 +2236,7 @@ plotHFGC(
   annotation = annot,
   annotcol = colours$direction %>%
     setNames(str_to_title(names(.))),
-  cytobands = bands_df,
+  #cytobands = bands_df,
   collapseTranscripts = ct, # Set this as a function of n_transcripts
   zoom = 1.1,
   max = width(grl_to_plot[[i]]),

@@ -106,12 +106,27 @@ filtered_counts %>%
 ### PCA
 
 ```{r plot-pca, fig.height = 5, fig.cap = "*PCA plots for logCPM values A) before and B) after Smooth Quantile normalisation*"}
-a <- plotAssayPCA(filtered_counts, "logCPM", colour = "treat", label = "label") +
+# the following is inserted to test run PCA on a small subset of data, since the OG is too big for non-HPC run. For actual run, use original script
+set.seed(1)
+
+mat <- assay(filtered_counts, "logCPM")
+
+# sample 5,000–20,000 features (adjust as needed)
+keep_idx <- sample(seq_len(nrow(mat)), size = 5000)
+filtered_small <- filtered_counts[keep_idx, ]
+a <- plotAssayPCA(filtered_small, "logCPM",  colour = "treat",label = "label") +
   scale_colour_manual(values = treat_colours) +
-  ggtitle("Pre-Normalisation")
-b <- plotAssayPCA(filtered_counts, "qsmooth", colour = "treat", label = "label") +
+  ggtitle("Pre-Normalisation (subset test)")
+b <- plotAssayPCA(filtered_small, "qsmooth", colour = "treat", label = "label") +
   scale_colour_manual(values = treat_colours) +
   ggtitle("Post-Normalisation")
+#below is the original script
+#a <- plotAssayPCA(filtered_counts, "logCPM", colour = "treat", label = "label") +
+ # scale_colour_manual(values = treat_colours) +
+ # ggtitle("Pre-Normalisation")
+#b <- plotAssayPCA(filtered_counts, "qsmooth", colour = "treat", label = "label") +
+ # scale_colour_manual(values = treat_colours) +
+ # ggtitle("Post-Normalisation")
 a + b + plot_layout(guides = "collect") + plot_annotation(tag_levels = "A")
 ```
 

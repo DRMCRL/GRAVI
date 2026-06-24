@@ -62,7 +62,8 @@ rep_col <- setdiff(
   colnames(samples), c("sample", "treat", "target", "input", "label", "qc")
 )
 samples[[rep_col]] <- as.factor(samples[[rep_col]])
-fdr_alpha <- config$comparisons$fdr
+#fdr_alpha <- 0.05 # FOR TESTING ONLY. do not use in actual run
+fdr_alpha <- config$comparisons$fdr # OG code, use this in actual run
 db_method <- match.arg(config$comparisons$method, c("sq-lt", "ls-ql"))
 ihw_opts <- c("regions", "features", "targets")
 ihw_method <- c(
@@ -88,11 +89,10 @@ blacklist <- import.bed(here::here(config$external$blacklist), seqinfo = sq)
 cb <- config$genome$build %>% 
   str_to_lower() %>% 
   paste0(".cytobands") 
-data(list = cb)
-bands_df <- get(cb)
-stopifnot(
-  colnames(bands_df) == c("chrom", "chromStart", "chromEnd", "name", "gieStain")
-)
+#data(list = cb)
+#bands_df <- get(cb)
+#stopifnot(
+#  colnames(bands_df) == c("chrom", "chromStart", "chromEnd", "name", "gieStain"))
 
 gtf_gene <- read_rds(file.path(annotation_path, "gtf_gene.rds"))
 id2gene <- structure(gtf_gene$gene_name, names = gtf_gene$gene_id)
@@ -166,7 +166,8 @@ if (length(hic_path) > 0)
         }
       ) %>% 
       unique()
-    hic$regions <- anchors(hic) %>% 
+    hic$counts <- rep(1, length(hic)) # this is added since the original bedpe file has imposed score = 0 for all interactions and this throws error
+     hic$regions <- anchors(hic) %>% 
       vapply(
         bestOverlap,
         y = GRangesList(lapply(gene_regions, granges)),
@@ -278,6 +279,7 @@ all_out <- list(
     )
   )
 )
+
 ## Initialise outputs from RNA-Seq
 cmn_diff <- cmn_up <- cmn_down <- tibble(leadingEdge = list())
 ```
@@ -597,6 +599,7 @@ merged_results <- mergeByCol(
       factor(levels = c("Up", "Down", "Ambiguous", "Unchanged")) %>% 
       droplevels()
   ) 
+saveRDS(merged_results, "debug_merged_results_first.rds")
 ```
 
 After selection of the `r comma(nrow(filtered_counts))` sliding windows (`r win_size`bp), these were merged into `r comma(length(merged_results))` genomic regions with size ranging from `r glue_collapse(range(width(merged_results)), last = " to ")`bp, with the median width being `r median(width(merged_results))`bp.
@@ -609,7 +612,9 @@ FDR-adjustment was performed with `r comma(sum(merged_results$P.Value_fdr < fdr_
 ## Independent Hypothesis Weighting {.tabset}
 
 ```{r set-ihw}
-fdr_column <- str_subset(names(mcols(merged_results)), "fdr|FDR")
+#fdr_column <- "P.Value" # FOR TESTING ONLY. do not use in actual run
+#fdr_alpha <- 0.05 # FORE TESTING ONLY.
+fdr_column <- str_subset(names(mcols(merged_results)), "fdr|FDR") # actual code, use this in actual  run
 ## Add status (direction) for the ihw = "none" possibility
 merged_results <- merged_results %>% 
   mutate(
@@ -620,6 +625,7 @@ merged_results <- merged_results %>%
       factor(levels = c(levels(direction), "Unchanged")) %>% 
       droplevels()
   )
+saveRDS(merged_results, "debug_merged_results_postset.rds")
 ```
 
 `r ifelse(ihw_method == "none", "No independent Hypothesis Weighting was specified", "")`
@@ -631,6 +637,7 @@ merged_results <- merged_results %>%
 ## Mapping Windows
 
 ```{r map-to-regions}
+saveRDS(merged_results, "debug_merged_results_postihw.rds")
 merged_results <- merged_results %>% 
   mutate(
     region = bestOverlap(
@@ -674,6 +681,9 @@ merged_results <- merged_results %>%
     enh2gene = extra_params$mapping$enh2gene,
     gi2gene = extra_params$mapping$gi2gene
   )
+# TEST
+saveRDS(gtf_gene, file = "debug_gtf_gene_preresults.rds") 
+saveRDS(merged_results, file = "debug_merged_results_postmap.rds")
 ```
 
 In addition to statistical analysis, merged windows were first mapped to the gene-centric region with the largest overlap.
@@ -1012,8 +1022,11 @@ cp <- htmltools::em(
 fs <- 12
 tbl <- merged_results %>%
   mutate(w = width) %>% 
-  arrange(!!sym(fdr_column)) %>% 
-  plyranges::slice(seq_len(show_n)) %>% 
+  arrange(!!sym(fdr_column)) %>%  
+#plyranges::slice(seq_len(show_n))%>% # original line, replacement below
+  head(show_n) %>% 
+  mutate(Range = paste0(seqnames, ":", start, "-", end)) %>% 
+	# back to OG script 
   select(
     w, AveExpr, logFC, FDR = !!sym(fdr_column), 
     overlaps_ref, Region = region, any_of("feature"), Genes = gene_name
@@ -1152,7 +1165,8 @@ profile_heatmaps <- sig_profiles %>%
     colour = "name",
     xLab = "Distance from Centre (bp)",
     fillLab = "logCPM",
-    mc.cores = length(sig_profiles)
+    mc.cores = 2
+    #mc.cores = length(sig_profiles)
   ) 
 fill_range <- profile_heatmaps %>% 
   lapply(function(x) x$data[,"score"]) %>% 
@@ -1480,6 +1494,7 @@ df %>%
 ## Inspection of Top-Ranked Regions {.tabset}
 
 ```{r grl-to-plot}
+#fdr_column <- "P.Value" # TESTING ONLY. remove this in actual run
 ## Define a GRL with the key ranges.
 ## Then we can step through it & make all of the requisite plots
 grl_to_plot <- GRangesList(
@@ -1709,7 +1724,8 @@ makeCaption <- function(.gr) {
 `r if (db_method == "sq-lt") "### Normalised Sliding Windows"`
 
 ```{r plot-qsmooth-top-ranges, eval = db_method == "sq-lt", fig.height = fh, echo = db_method == "sq-lt", fig.cap = glue("*Most highly ranked ranges for both gained and decreased {target} binding in repsonse to {treat_levels[[2]]} treatment. The smooth-quantile normalised values are shown across the initial set of sliding windows before merging. Ranges were chosen as the most extreme for FDR, Binding Strength (Signal) and logFC. Windows are shown free of the genomic context.*")}
-grl_to_plot %>% 
+# the next chunk is tmeporarily inserted to see where the error in pivot_longer() comes from
+tmp <- grl_to_plot %>% 
   lapply(
     function(x){
       filtered_counts %>% 
@@ -1725,8 +1741,16 @@ grl_to_plot %>%
         list()
     }
   ) %>% 
-  as_tibble() %>% 
-  pivot_longer(everything()) %>% 
+  as_tibble()
+
+saveRDS(tmp, "debug_tmp.rds")
+
+print(tmp)
+print(names(tmp))
+print(sapply(tmp, class))
+
+tmp %>%
+  pivot_longer(everything()) %>%
   unnest(everything()) %>% 
   mutate(
     direction = str_extract(name, "down|up"),
@@ -1763,20 +1787,81 @@ grl_to_plot %>%
     x = "Sliding Window\n(Unmerged)", y = "SQ-Normalised logCPM", colour = "Treat",
     linetype = str_sep_to_title(rep_col)
   )
+
+# the below is the og script in full
+#grl_to_plot %>% 
+#  lapply(
+#    function(x){
+#      filtered_counts %>% 
+#        subsetByOverlaps(x) %>% 
+#	assay("qsmooth") %>% 
+#        as_tibble(rownames = "window") %>% 
+#        pivot_longer(
+#          cols = all_of(colnames(.)),
+#          names_to = "sample",
+#          values_to = "logCPM"
+#        ) %>% 
+#        mutate(range = as.character(x)) %>% 
+#        list()
+ #   }
+ # ) %>% 
+ # as_tibble() %>% 
+ # pivot_longer(everything()) %>% 
+ # unnest(everything()) %>% 
+ # mutate(
+ #   direction = str_extract(name, "down|up"),
+  #  by = str_extract(name, "by_.+"),
+   # across(
+    #  all_of(c("name", "direction", "by")), str_sep_to_title
+   # ),
+   # name = str_remove_all(name, "Top ") %>% 
+    #  str_replace_all("Lfc", "logFC") %>% 
+     # str_replace_all("Fdr", "FDR") %>% 
+      #str_replace_all("Expr", "Highest Signal") %>% 
+      #str_replace_all("By (.+)", "(\\1)") %>% 
+      #str_replace_all("No Macs2", "(No Macs2 Peak)"),
+   # window = as.integer(window)
+ # ) %>% 
+ # left_join(samples, by = "sample") %>% 
+ # ggplot(
+ #   aes(window, logCPM, colour = treat, linetype = !!sym(rep_col))
+ # ) +
+ # geom_line(
+ #   data = . %>% 
+ #     group_by(name) %>% 
+ #     dplyr::filter(max(window) > 1)
+ # ) + 
+ # geom_point(
+ #   data = . %>% 
+  #    group_by(name) %>% 
+   #   dplyr::filter(max(window) == 1),
+    #show.legend = FALSE
+ # ) + 
+ # facet_wrap(~name + range, scales = "free_x") +
+ # scale_colour_manual(values = treat_colours) + 
+ # labs(
+ #   x = "Sliding Window\n(Unmerged)", y = "SQ-Normalised logCPM", colour = "Treat",
+ #   linetype = str_sep_to_title(rep_col)
+ # )
 ```
 
 `r ifelse("top_down_by_expr" %in% names(grl_to_plot), "### Decreased Binding (Strongest Signal)", "")`
 
 ```{r plot-top-down-by-expr, eval = "top_down_by_expr" %in% names(grl_to_plot), echo = "top_down_by_expr" %in% names(grl_to_plot), fig.cap = makeCaption(grl_to_plot$top_down_by_expr)}
-plotHFGC(
-  grl_to_plot$top_down_by_expr,
+# this bit is added since using the shorthand in the original script results in a nested granges object and not plottable. this will be applied for all plots of this kind in this section
+gr <- grl_to_plot$top_down_by_expr
+bad_cols <- vapply(mcols(gr), inherits, logical(1), "GRanges")
+mcols(gr)[bad_cols] <- NULL
+
+plotHFGC(gr, #added
+  #grl_to_plot$top_down_by_expr,
   hic = hic,
   features = feat_gr,featcol = feature_colours, featsize = 1 + has_features,
   genes = hfgc_genes, genecol = gene_col,
   coverage = bwfl, linecol = line_col,
   annotation = annot, 
   annotcol = direction_colours,
-  cytobands = bands_df,
+  #cytobands = bands_df,
   collapseTranscripts = FALSE,
   zoom = 10,
   max = 10 * width(grl_to_plot$top_down_by_expr),
@@ -1789,15 +1874,19 @@ plotHFGC(
 `r ifelse("top_down_by_fdr" %in% names(grl_to_plot), "### Decreased Binding (Lowest FDR)", "")`
 
 ```{r plot-top_down_by_fdr, eval = "top_down_by_fdr" %in% names(grl_to_plot), echo = "top_down_by_fdr" %in% names(grl_to_plot), fig.cap = makeCaption(grl_to_plot$top_down_by_fdr)}
-plotHFGC(
-  grl_to_plot$top_down_by_fdr,
+# see above
+gr <- grl_to_plot$top_down_by_fdr
+bad_cols <- vapply(mcols(gr), inherits, logical(1), "GRanges")
+mcols(gr)[bad_cols] <- NULL
+plotHFGC(gr,
+  #grl_to_plot$top_down_by_fdr,
   hic = hic,
   features = feat_gr,featcol = feature_colours, featsize = 1 + has_features,
   genes = hfgc_genes, genecol = gene_col,
   coverage = bwfl, linecol = line_col,
   annotation = annot, 
   annotcol = direction_colours,
-  cytobands = bands_df,
+  #cytobands = bands_df,
   collapseTranscripts = FALSE,
   zoom = 10,
   max = 10 * width(grl_to_plot$top_down_by_fdr),
@@ -1810,15 +1899,19 @@ plotHFGC(
 `r ifelse("top_down_by_lfc" %in% names(grl_to_plot), "### Decreased Binding (Most Extreme)", "")`
 
 ```{r plot-top_down_by_lfc, eval = "top_down_by_lfc" %in% names(grl_to_plot), echo = "top_down_by_lfc" %in% names(grl_to_plot), fig.cap = makeCaption(grl_to_plot$top_down_by_lfc)}
-plotHFGC(
-  grl_to_plot$top_down_by_lfc,
+#see above
+gr <- grl_to_plot$top_down_by_lfc
+bad_cols <- vapply(mcols(gr), inherits, logical(1), "GRanges")
+mcols(gr)[bad_cols] <- NULL
+plotHFGC(gr,
+  #grl_to_plot$top_down_by_lfc,
   hic = hic,
   features = feat_gr,featcol = feature_colours, featsize = 1 + has_features,
   genes = hfgc_genes, genecol = gene_col,
   coverage = bwfl, linecol = line_col,
   annotation = annot, 
   annotcol = direction_colours,
-  cytobands = bands_df,
+  #cytobands = bands_df,
   collapseTranscripts = FALSE,
   zoom = 10, 
   max = 10 * width(grl_to_plot$top_down_by_lfc),
@@ -1831,15 +1924,19 @@ plotHFGC(
 `r ifelse("top_down_no_macs2" %in% names(grl_to_plot), "### Significant Decreased Binding (No Union Peak)", "")`
 
 ```{r plot-top_down_no_macs2, eval = "top_down_no_macs2" %in% names(grl_to_plot), echo = "top_down_no_macs2" %in% names(grl_to_plot), fig.cap = makeCaption(grl_to_plot$top_down_no_macs2)}
-plotHFGC(
-  grl_to_plot$top_down_no_macs2,
+#see above
+gr <- grl_to_plot$top_down_no_macs2
+bad_cols <- vapply(mcols(gr), inherits, logical(1), "GRanges")
+mcols(gr)[bad_cols] <- NULL
+plotHFGC(gr,
+  #grl_to_plot$top_down_no_macs2,
   hic = hic,
   features = feat_gr,featcol = feature_colours, featsize = 1 + has_features,
   genes = hfgc_genes, genecol = gene_col,
   coverage = bwfl, linecol = line_col,
   annotation = annot, 
   annotcol = direction_colours,
-  cytobands = bands_df,
+  #cytobands = bands_df,
   collapseTranscripts = FALSE,
   zoom = 10,
   max = 10 * width(grl_to_plot$top_down_no_macs2),
@@ -1851,15 +1948,18 @@ plotHFGC(
 `r ifelse("top_up_by_expr" %in% names(grl_to_plot), "### Increased Binding (Strongest Signal)", "")`
 
 ```{r plot-top-up-by-expr, eval = "top_up_by_expr" %in% names(grl_to_plot), echo = "top_up_by_expr" %in% names(grl_to_plot), fig.cap = makeCaption(grl_to_plot$top_up_by_expr)}
-plotHFGC(
-  grl_to_plot$top_up_by_expr,
+gr <- grl_to_plot$top_up_by_expr
+bad_cols <- vapply(mcols(gr), inherits, logical(1), "GRanges")
+mcols(gr)[bad_cols] <- NULL
+plotHFGC(gr,
+  #grl_to_plot$top_up_by_expr,
   hic = hic,
   features = feat_gr,featcol = feature_colours, featsize = 1 + has_features,
   genes = hfgc_genes, genecol = gene_col,
   coverage = bwfl, linecol = line_col,
   annotation = annot, 
   annotcol = direction_colours,
-  cytobands = bands_df,
+  #cytobands = bands_df,
   collapseTranscripts = FALSE,
   zoom = 10,
   max = 10 * width(grl_to_plot$top_up_by_expr),
@@ -1872,15 +1972,19 @@ plotHFGC(
 `r ifelse("top_up_by_fdr" %in% names(grl_to_plot), "### Increased Binding (Lowest FDR)", "")`
 
 ```{r plot-top_up_by_fdr, eval = "top_up_by_fdr" %in% names(grl_to_plot), echo = "top_up_by_fdr" %in% names(grl_to_plot), fig.cap = makeCaption(grl_to_plot$top_up_by_fdr)}
-plotHFGC(
-  grl_to_plot$top_up_by_fdr,
+#see above
+gr <- grl_to_plot$top_up_by_fdr
+bad_cols <- vapply(mcols(gr), inherits, logical(1), "GRanges")
+mcols(gr)[bad_cols] <- NULL
+plotHFGC(gr,
+  #grl_to_plot$top_up_by_fdr,
   hic = hic,
   features = feat_gr,featcol = feature_colours, featsize = 1 + has_features,
   genes = hfgc_genes, genecol = gene_col,
   coverage = bwfl, linecol = line_col,
   annotation = annot, 
   annotcol = direction_colours,
-  cytobands = bands_df,
+  #cytobands = bands_df,
   collapseTranscripts = FALSE,
   zoom = 10,
   max = 10 * width(grl_to_plot$top_up_by_fdr),
@@ -1893,15 +1997,19 @@ plotHFGC(
 `r ifelse("top_up_by_lfc" %in% names(grl_to_plot), "### Increased Binding (Most Extreme)", "")`
 
 ```{r plot-top_up_by_lfc, eval = "top_up_by_lfc" %in% names(grl_to_plot), echo = "top_up_by_lfc" %in% names(grl_to_plot), fig.cap = makeCaption(grl_to_plot$top_up_by_lfc)}
-plotHFGC(
-  grl_to_plot$top_up_by_lfc,
+#see above
+gr <- grl_to_plot$top_up_by_lfc
+bad_cols <- vapply(mcols(gr), inherits, logical(1), "GRanges")
+mcols(gr)[bad_cols] <- NULL
+plotHFGC(gr,
+  #grl_to_plot$top_up_by_lfc,
   hic = hic,
   features = feat_gr,featcol = feature_colours, featsize = 1 + has_features,
   genes = hfgc_genes, genecol = gene_col,
   coverage = bwfl, linecol = line_col,
   annotation = annot, 
   annotcol = direction_colours,
-  cytobands = bands_df,
+  #cytobands = bands_df,
   collapseTranscripts = FALSE,
   zoom = 10,
   max = 10 * width(grl_to_plot$top_up_by_lfc),
@@ -1914,15 +2022,19 @@ plotHFGC(
 `r ifelse("top_up_no_macs2" %in% names(grl_to_plot), "### Significant Increased Binding (No Union Peak)", "")`
 
 ```{r plot-top_up_no_macs2, eval = "top_up_no_macs2" %in% names(grl_to_plot), echo = "top_up_no_macs2" %in% names(grl_to_plot), fig.cap = makeCaption(grl_to_plot$top_up_no_macs2)}
-plotHFGC(
-  grl_to_plot$top_up_no_macs2,
+#see above
+gr <- grl_to_plot$top_up_no_macs2
+bad_cols <- vapply(mcols(gr), inherits, logical(1), "GRanges")
+mcols(gr)[bad_cols] <- NULL
+plotHFGC(gr,
+  #grl_to_plot$top_up_no_macs2,
   hic = hic,
   features = feat_gr,featcol = feature_colours, featsize = 1 + has_features,
   genes = hfgc_genes, genecol = gene_col,
   coverage = bwfl, linecol = line_col,
   annotation = annot, 
   annotcol = direction_colours,  
-  cytobands = bands_df,
+  #cytobands = bands_df,
   collapseTranscripts = FALSE,
   zoom = 10,
   max = 10 * width(grl_to_plot$top_up_no_macs2),
@@ -1941,7 +2053,8 @@ max_gs_size <- extra_params$enrichment$max_size
 if (is.null(max_gs_size) | is.na(max_gs_size)) max_gs_size <- Inf
 min_sig <- extra_params$enrichment$min_sig
 if (is.null(min_sig) | is.na(min_sig)) min_sig <- 1
-msigdb <- msigdbr(species = "Homo sapiens") %>% 
+msigdb <- msigdbr(species = "Mus musculus") %>% #should have species as an adjustable param 
+  rename(gs_cat = gs_source_species, gs_subcat = gs_subcollection) %>% 
   dplyr::filter(
     gs_cat %in% unlist(extra_params$enrichment$msigdb$gs_cat) |
       gs_subcat %in% unlist(extra_params$enrichment$msigdb$gs_subcat),
@@ -2069,13 +2182,48 @@ All network plots were generated using the `r net_layout` layout algorithm.
 
 
 ```{r goseq-mapped, fig.show='hide'}
+saveRDS(gtf_gene, file = "debug_gtf_gene.rds") ## ADD ME NEXT TIME
+saveRDS(merged_results, file = "debug_merged_results.rds") ## ADD ME NEXT TIME
+# the next chunk is custom added to break down the leadup to nullp() (which runs into error) for diagnostics purpose
+tmp1 <- gtf_gene %>%
+  mutate(w = width(.)) %>%
+  as_tibble() %>%
+  dplyr::select(gene_id, w) %>%
+  arrange(desc(w)) %>%
+  distinct(gene_id, .keep_all = TRUE)
+tmp2 <- tmp1 %>%
+  mutate(mapped = ifelse( is.na(gene_id),FALSE,gene_id %in% unlist(merged_results$gene_id)))
+tmp3 <- tmp2 %>%
+  filter(!is.na(gene_id)) %>%
+  filter(!is.na(w), w > 0) %>%
+  mutate(bias = log10(w)) %>%
+  filter(is.finite(bias))
+mapped_vec <- tmp3$mapped
+names(mapped_vec) <- tmp3$gene_id
+bias_vec <- tmp3$bias
+names(bias_vec) <- tmp3$gene_id
+stopifnot(!any(is.na(names(mapped_vec))))
+stopifnot(!any(duplicated(names(mapped_vec))))
+saveRDS(tmp1, file = "debug_tmp1.rds")
+saveRDS(tmp2, file = "debug_tmp2.rds")
+saveRDS(tmp3, file = "debug_tmp3.rds")
+
+pwf_mapped <- goseq::nullp(
+  mapped_vec,
+  genome = config$genome$build,
+  bias.data = bias_vec,
+  plot.fit = TRUE
+)
+#below is the original script
 pwf_mapped <- gtf_gene %>% 
   mutate(w = width(.)) %>% 
   as_tibble() %>% 
   dplyr::select(gene_id, w) %>% 
   arrange(desc(w)) %>% 
   distinct(gene_id, .keep_all = TRUE) %>% 
-  mutate(mapped = gene_id %in% unlist(merged_results$gene_id)) %>% 
+  # custom script to combat NA
+  mutate(mapped = ifelse( is.na(gene_id),FALSE,gene_id %in% unlist(merged_results$gene_id))) %>%
+ # mutate(mapped = gene_id %in% unlist(merged_results$gene_id)) %>% #original script
   with(
     nullp(
       structure(mapped, names = gene_id),

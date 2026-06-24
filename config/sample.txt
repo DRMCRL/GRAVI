@@ -1,0 +1,12 @@
+sample	target	treat	input	replicate
+AR_PMSG1	AR	PMSG	AR_input	1
+AR_PMSG2	AR	PMSG	AR_input	2
+AR_PMSG3	AR	PMSG	AR_input	3
+AR_PMSG4	AR	PMSG	AR_input	4
+AR_hCG2	AR	hCG	AR_input	1
+AR_hCG3	AR	hCG	AR_input	2
+AR_hCG4	AR	hCG	AR_input	3
+GR_PMSG1	GR	PMSG	GR_input	1
+GR_PMSG2	GR	PMSG	GR_input	2
+GR_hCG1	GR	hCG	GR_input	1
+GR_hCG2	GR	hCG	GR_input	2

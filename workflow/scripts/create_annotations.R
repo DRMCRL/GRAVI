@@ -19,6 +19,7 @@ library(plyranges)
 library(yaml)
 library(Rsamtools)
 library(extraChIPs)
+library(GenomeInfoDb) #Thao adds this in
 
 args <- commandArgs(TRUE)
 config <- read_yaml(here::here("config", "config.yml"))

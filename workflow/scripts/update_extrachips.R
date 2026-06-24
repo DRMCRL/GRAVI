@@ -1,3 +1,11 @@
+.libPaths(c(
+  Sys.getenv("R_LIBS_SITE"),
+  Sys.getenv("R_LIBS_USER")
+))
+cat("=== LIBPATHS ===\n")
+print(.libPaths())
+cat("===============\n")
+
 args <- commandArgs(TRUE)
 f <- args[[1]]
 reqd_version <- args[[2]]

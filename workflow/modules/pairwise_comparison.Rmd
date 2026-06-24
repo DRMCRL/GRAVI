@@ -1,7 +1,8 @@
-
+\
 ```{r get_params, echo = FALSE}
 threads <- params$threads
 pairs <- params$pairs
+saveRDS(pairs, "debug_pairs.rds")
 ```
 
 
@@ -117,8 +118,8 @@ comp_cols <- setNames(hcl.colors(3, "Zissou1", rev = TRUE), c(comps, "Both"))
 cb <- config$genome$build %>% 
   str_to_lower() %>% 
   paste0(".cytobands") 
-data(list = cb)
-bands_df <- get(cb)
+#data(list = cb)
+#bands_df <- get(cb)
 sq <- read_rds(file.path(annotation_path, "seqinfo.rds"))
 blacklist <- import.bed(here::here(config$external$blacklist), seqinfo = sq)
 
@@ -350,6 +351,7 @@ comp_name <- glue(
   "{targets[[2]]}_{pairs[[2]][[1]]}_{pairs[[2]][[2]]}"
 )
 fig_path <- here::here("docs", "assets", comp_name)
+saveRDS(fig_path, "debug_figpath.rds")
 if (!dir.exists(fig_path)) dir.create(fig_path, recursive = TRUE)
 if (interactive()) {
   fig_dev <- "png"
@@ -1009,9 +1011,12 @@ df %>%
 ## Pairwise Signal
 
 ```{r plot-pairwise-signal, fig.cap = glue("Pairwise signal levels with boxplots indicating the baseline signal whether signal was detected in both  or individual comparisons.")}
+saveRDS(db_results, "debug_db_results_pairwise.Rmd")
 db_results %>% 
   plotPairwise(
-    var = cpm_column, alpha = 0.6, side_panel_width = 0.2,
+    var = AveExpr, # custom line, explicitly state col to plot
+    #var = cpm_column, # og line, also yields "AveExpr" but doesn't work for some reason
+    alpha = 0.6, side_panel_width = 0.2,
   ) +
   scale_fill_manual(
     values = setNames(
@@ -1262,6 +1267,10 @@ profile_heatmaps <- profile_heatmaps %>%
 ```
 
 ```{r plot-all-profile-heatmaps}
+saveRDS(profile_heatmaps, "debug_profile_heatmaps.rds") #testing purposes
+saveRDS(grl_to_plot, "debug_grltoplot.rds") #testing purposes
+timetest <- system.time(print(profile_heatmaps[[1]])) #testing purposes only
+saveRDS(timetest, "debug_timetest.rds") # testing purposes only
 htmltools::tagList(
   mclapply(
     seq_along(profile_heatmaps),
@@ -1318,7 +1327,8 @@ htmltools::tagList(
         )
       )
     },
-    mc.cores = threads
+    mc.cores = 1 # new line to see if this stops this from taking forever
+    #mc.cores = threads # og line
   )
 )
 ```
@@ -1530,7 +1540,7 @@ htmltools::tagList(
         genes = hfgc_genes, genecol = gene_col,
         coverage = bwfl, linecol = line_col,
         annotation = annot, annotcol = annot_col,
-        cytobands = bands_df,
+        #cytobands = bands_df,
         rotation.title = 90,
         zoom = 10,
         ylim = y_lim,
@@ -1570,7 +1580,8 @@ htmltools::tagList(
         )
       )
     },
-    mc.cores = threads
+    mc.cores = 1 # custom line
+    #mc.cores = threads #og line
   )
 )  
 ```
@@ -1676,7 +1687,7 @@ htmltools::tagList(
         genes = hfgc_genes, genecol = gene_col,
         coverage = bwfl, linecol = line_col,
         annotation = annot, annotcol = annot_col,
-        cytobands = bands_df,
+        #cytobands = bands_df,
         rotation.title = 90,
         zoom = 10,
         ylim = y_lim,
@@ -1716,7 +1727,8 @@ htmltools::tagList(
         )
       )
     },
-    mc.cores = threads
+    mc.cores = 1 # custom line
+    #mc.cores # threads #og line
   )
 )  
 ```
@@ -1751,6 +1763,7 @@ all_ids <- gtf_gene %>%
     n_windows = as.integer(ifelse(is.na(n_windows), 0, n_windows))
   )
 msigdb <- msigdbr(species = extra_params$enrichment$species) %>% 
+  rename(gs_cat = gs_source_species, gs_subcat = gs_subcollection) %>%  # added line to make gs_cat and gs_subcat recognisable
   dplyr::filter(
     gs_cat %in% unlist(extra_params$enrichment$msigdb$gs_cat) |
       gs_subcat %in% unlist(extra_params$enrichment$msigdb$gs_subcat),
@@ -2527,7 +2540,8 @@ goseq_group_res <- group_ids %>%
       }
       res
     },
-    mc.cores = threads
+    mc.cores = 1
+    #mc.cores = threads
   ) %>% 
   ## This step at the end basically removes any groups with no results
   lapply(list) %>% 
@@ -2682,7 +2696,8 @@ htmltools::tagList(
           )
         )
       },
-      mc.cores = threads
+      mc.cores = 1 # custom line
+      #mc.cores = threads #og line
     )
 )
 ```
@@ -2813,7 +2828,8 @@ htmltools::tagList(
           )
         )
       },
-      mc.cores = threads
+      mc.cores = 1 # custom line
+      #mc.cores = threads #og line
     )
 )
 ```
