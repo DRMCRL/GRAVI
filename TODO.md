@@ -14,6 +14,7 @@
 - See if deeptools bamCoverage can replace bigwig generation from bedgraph, as this allows for read normalisation
 - See if deeptools Pearson/Spearman sample correlation can be included as a plot
 - Is there currently a TF1 vs TF2 correlation plot? If not then this should be included.
+- Consider upgrade to MACS3, which presumably handles large file / memory better
 - See what is required to extend this to non-human/non-mouse species
 - Have informative error messages to inform if DBS analysis finds no signicant peaks. As of current this will throw R script errors that requires digging through the intermediary Robj to find out.
 - For dummies like me - consider having an early correlation tet checkpoint for replicates within same group, and flag error early if replicates within groups show lower correlation than samples across groups.
