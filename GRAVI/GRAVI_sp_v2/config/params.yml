@@ -1,0 +1,87 @@
+## This file contains additional parameters which can be modified, but are
+## generally not required to be modified
+
+## The key values used when defining gene-centric regions
+gene_regions:
+  promoters:
+    upstream: 1500
+    downstream: 500
+  upstream: 5000
+  proximal: 10000
+  intron: true
+
+## The values used when mapping peaks to genes.
+## Passed to `extraChIPs::mapByFeature()`
+## If including H3K27ac HiChIP for long range-interactions, it is advised to
+## set `enh2gene` as zero, given that long range interactions in this case
+## will more accurately map long-range enhancer interactions
+mapping:
+  gr2prom: 0
+  gr2enh: 0
+  gr2gi: 0
+  gr2gene: 100000
+  prom2gene: 0
+  enh2gene: 100000
+  gi2gene: 0
+
+## The categories to use from MSigDB. These are passed to msigdbr in the
+## columns of the same name in an 'OR' approach
+msigdb:
+  db_species: "MM" # this is specified, since using species alone breaks in mouse. For human, use "HS".
+  species: "mouse" # for human, use "human"
+  gs_collection: "M"
+  gs_subcollection:
+    - "CP:KEGG"
+    - "CP:REACTOME"
+    - "CP:WIKIPATHWAYS"
+    - "TFT:GTRD"
+  size: [5,1000] ## Gene-sets outside this range will be excluded from testing
+
+## Anything entered here will be passed to MotifDb to provide PWMs
+motifdb:
+  data_source:
+    #- "HOCOMOCOv11-core-A" #HOCOMOCO in this dataset has Hsapiens info only
+    #- "HOCOMOCOv11-core-B"
+    #- "HOCOMOCOv11-core-C"
+     - "jaspar2024" # use this instead of JASPAR_CORE since there's a motif clustering step later to reduce dimension anw
+  organism:
+    - "Mmusculus"
+
+motif_clustering:
+  agglom: "single"
+  type: "PPM"
+  method: "EUCL"
+  min_overlap: 0.9
+  thresh: 0.08
+  normalise_scores: true
+  min_position_ic: 0.1
+
+enrichment:
+  adj: "fdr"
+  alpha: 0.05
+  method: "great" # Define a wrapper to pass either 'great' or 'gene_id'
+  min_sig: 3 ## Only gene-sets above this size will be shown in the results
+
+## Passed to regionerReloaded::multiLocalZScore
+regioner:
+  adj: "fdr"
+  alpha: 0.05
+  ntimes: 5000
+  window: 5000
+  step: 100
+
+## Used for network plots
+networks:
+  size: [4, 80]
+  max_distance: 0.9
+  layout: 'fr'
+
+## For calling NFRs, noting that a nucleosome is ~147bp
+## HisTrader calls multiple NFRs / peak breaking signal into bins of 25bp
+## representing of 150/6, which itself takes 150nt as an approximation of 147bp
+nfr:
+  p_max: 0.25
+  nfr_width: [75, 1000] 
+  min_peak_width: 200 #originally 500
+  merge_peaks_within: 100 #originally 300
+  merge_nfrs_within: 76

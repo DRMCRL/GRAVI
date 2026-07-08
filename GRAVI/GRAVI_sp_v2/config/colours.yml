@@ -1,0 +1,93 @@
+## Plot colours propagated through all markdown documents for
+## consistency. Treat colours must match all treatments specified in config.yml
+## with the addition of a colour for input/control samples
+## Default QC, Direction and treat palettes are colourblind friendly
+qc:
+  pass: "#03A772"
+  fail: "#C10724"
+
+direction:
+  increased: "#CA0020"
+  decreased: "#0571B0"
+  unchanged: "#9A9A9A"
+  undetected: "#D5D5D5"
+  ambiguous: "#201040"
+
+## https://davidmathlogic.com/colorblind/#%23CA0020-%230571B0-%239A9A9A-%23FF7F00-%23BE7EC7-%23FB9A99-%23A6CEE3-%236E8C6C-%234B2596
+## The describes the x-variable & the second is y, .i.e. x-increased_y-increased
+pairwise:
+  ## The first three are concordant and set as above
+  increased_increased: "#CA0020"
+  decreased_decreased: "#0571B0"
+  unchanged_unchanged: "#9A9A9A"
+  ## Discordant
+  increased_decreased: "#FF7F00"
+  decreased_increased: "#BE7EC7"
+  ## Changed in one
+  increased_unchanged: "#FB9A99"
+  decreased_unchanged: "#A6CEE3"
+  unchanged_increased: "#6E8C6C"
+  unchanged_decreased: "#4B2596"
+
+# https://davidmathlogic.com/colorblind/#%231E76CC-%239E172E-%23D4BE54-%23698A74-%235F4F71-%23A2720C
+treat:
+  Input: "#33333380"
+  default: ["#1E76CC", "#9E172E", "#D4BE54", "#698A74", "#5F4F71", "#A2720C"]
+
+
+regions:
+  promoter: '#FF0000'
+  upstream_promoter: '#FF8500'
+  exon: '#54FF9F'
+  intron: '#006400'
+  proximal_intergenic: '#4682B4'
+  distal_intergenic: '#0000CD'
+  ## These two will be used if no intron/exon structure is used
+  ## or if only 1 intergenic category is set
+  gene_body: '#008000'
+  intergenic: '#27408B'
+
+features:
+  no_feature: "#E5E5E5"
+  Other: "#303030" # Used when lumping small groups together
+  ## Set some defaults for all ChromHMM tracks
+  BivFlnk: '#E9967A'
+  DNase: '#FFFF66'
+  EnhA1: '#FFC34D'
+  EnhA2: '#FFC34D'
+  EnhAc: '#FFFF00'
+  EnhAF: '#FFC34D'
+  EnhBiv: '#BDB76B'
+  EnhG1: '#C2E105'
+  EnhG2: '#C2E105'
+  EnhW1: '#FFFF00'
+  EnhW2: '#FFFF00'
+  EnhWk: '#FFFF00'
+  Het: '#8A91D0'
+  PromBiv: '#7030A0'
+  PromD1: '#FF4500'
+  PromD2: '#FF4500'
+  PromP: '#E6B8B7'
+  PromU: '#FF4500'
+  Quies: '#F9F9F9'
+  ReprPC: '#808080'
+  ReprPCWk: '#C0C0C0'
+  TssA: '#FF0000'
+  TssAFlnk: '#FF4500'
+  TssBiv: '#CD5C5C'
+  TssFlnk: '#FF4500'
+  TssFlnkD: '#FF4500'
+  TssFlnkU: '#FF4500'
+  Tx: '#008000'
+  Tx3: '#008000'
+  Tx5: '#008000'
+  TxEnh3: '#C2E105'
+  TxEnh5: '#C2E105'
+  TxEnhW: '#C2E105'
+  TxFlnk: '#32CD32'
+  TxReg: '#C2E105'
+  TxWk: '#009600'
+  ZNF/Rpts: '#66CDAA'
+  ## Some other possible features here
+  enhancer: "#FFC360"
+

@@ -1,0 +1,134 @@
+#' Create the local ZScores enabled by regioneReloaded comparing targets
+#' to other targets
+#'
+#' This is a process requiring large amounts of RAM and multi-threading
+#' The recommended number of permutations is 5000
+#'
+#' Required input files will be:
+#'
+#' 1. All union peaks
+#' 2. The seqinfo object
+#'
+#' Required output files will be:
+#'
+#' 1. "output/macs2/shared/all_consensus_localz.rds")
+#'
+#' It will be assumed that 5K permutations will be performed and that window
+#' sizes are +/-5kb for a 10kb region
+#'
+conda_pre <- system2("echo", "$CONDA_PREFIX", stdout = TRUE)
+if (conda_pre != "") {
+  conda_lib_path <- file.path(conda_pre, "lib", "R", "library")
+  if (!dir.exists(conda_lib_path)) conda_lib_path <- NULL
+  prev_paths <- .libPaths()
+  paths_to_set <- unique(c(conda_lib_path, prev_paths))
+  .libPaths(paths_to_set)
+}
+## A function for printing input
+cat_list <- function(x, slot = NULL, sep = "\n\t"){
+  nm <- setdiff(names(x), "")
+  invisible(
+    lapply(
+      nm,
+      \(i) cat("Received", slot, i, sep, paste0( x[[i]], "\n\t"), "\n")
+    )
+  )
+}
+cat_time <- function(...){
+  tm <- format(Sys.time(), "%Y-%b-%d %H:%M:%S\t")
+  cat(tm, ..., "\n")
+}
+
+if ("snakemake" %in% ls()) {
+  config <- slot(snakemake, "config")
+  all_input <- slot(snakemake, "input")
+  all_output <- slot(snakemake, "output")
+  all_params <- slot(snakemake, "params")
+  threads <- slot(snakemake, "threads")[[1]] - 1
+  # threads <- 1
+  log <- slot(snakemake, "log")[[1]]
+  message("Setting stdout to ", log, "\n")
+  sink(log, split = TRUE)
+} else {
+  # Manual lists for testing. Will be overwritten by snakemake objects...
+  config <- yaml::read_yaml("config/config.yml")
+  all_input <- list(
+    peaks = c(
+        "output/peak_analysis/AR/AR_consensus_peaks.bed.gz",
+        "output/peak_analysis/H3K27ac/H3K27ac_consensus_peaks.bed.gz",
+        "output/peak_analysis/GATA3/GATA3_consensus_peaks.bed.gz",
+        "output/peak_analysis/ER/ER_consensus_peaks.bed.gz"
+    ),
+    sq = "output/annotations/seqinfo.rds"
+  )
+  all_output <- list(
+    rds = "output/peak_analysis/shared/shared_targets_localz.rds"
+  )
+  all_params <- yaml::read_yaml("config/params.yml")
+  threads <- 1
+}
+
+regioner_params <- all_params$regioner
+cat_list(all_input, "input")
+cat_list(all_output, "output")
+cat_list(regioner_params, "regioner params")
+
+## Solidify file paths
+all_input <- lapply(all_input, here::here)
+all_output <- lapply(all_output, here::here)
+
+cat_time("Loading packages...")
+library(regioneReloaded)
+library(extraChIPs)
+library(plyranges)
+library(readr)
+library(yaml)
+library(GenomicRanges)
+library(parallel)
+cat_time("done\n")
+
+mlz_list <- list()
+if (length(all_input$peaks) < 2) {
+  cat_time("2 or more sets of peaks required. No analysis performed")
+} else {
+
+  cat_time("Determining the UCSC compatible reference.. ")
+  source(here::here("workflow/scripts/get_ucsc.R"))
+  ucsc <- get_ucsc(config$genome$build)
+  cat_time("done\n")
+
+  cat_time("Setting genome to be", ucsc$build)
+  sq <- read_rds(all_input$sq)
+  genome(sq) <- ucsc$build
+  cat_time(" done\n")
+
+  cat_time("Loading peaks from", paste("\n\t", all_input$peaks))
+  peaks <- importPeaks(all_input$peaks, seqinfo = sq, type = "bed")
+  names(peaks) <- gsub("_consensus.+", "", names(peaks))
+  cat_time(" done\n")
+
+  cat_time("Running multiLocalZscore with", threads, "threads...\n")
+  mlz_params <- list(
+    sampling = FALSE, ranFUN = "resampleGenome", evFUN = "numOverlaps",
+    max_pv = 1, genome = ucsc$build, mc.cores = 1
+  )
+  mlz_params <- c(mlz_params, regioner_params[c("ntimes", "step", "window")])
+  mlz_list <- names(peaks) %>%
+    mclapply(
+      \(i) {
+        # cat_time("Calculating local Z-scores for target ", i, "\n")
+        x <- peaks[[i]]
+        y <- peaks[setdiff(names(peaks), i)]
+        params <- c(list(A = x, Blist = y), mlz_params)
+        do.call("multiLocalZscore", params)
+      },
+      mc.cores = min(threads, length(.))
+    ) %>%
+    setNames(names(peaks))
+  cat_time("Done")
+
+}
+
+cat_time("Writing to", all_output$rds, "\n")
+write_rds(mlz_list, all_output$rds, compress = "gz")
+cat_time("done\n")

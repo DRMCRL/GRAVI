@@ -1,0 +1,432 @@
+import pandas as pd
+import os
+import re
+import subprocess
+import urllib
+import sys
+import random
+import itertools
+import yaml
+import json
+
+## For manual testing...
+# from snakemake.io import expand
+# f = "config/config.yml"
+# config = yaml.safe_load(open(f))
+
+configfile: "config/config.yml"
+
+## Load the additional params
+f = "config/params.yml"
+extra_params = yaml.safe_load(open(f))
+nfr_params = extra_params['nfr']
+
+## Figure out how to run check_yaml from here if possible
+## python scripts/check_yaml.py
+
+####################################
+## Check all external files exist ##
+####################################
+for i in config['external']:
+	f = config['external'][i]
+	if type(f) == str:
+		msg = "File " + f + " not found"
+		assert (os.path.isfile(f)), msg
+	if type(f) == dict:
+		for j in set(f.keys()):
+			msg = "File " + f[j] + " not found"
+			assert(os.path.isfile(f[j])), msg
+
+
+####################
+## Define Samples ##
+####################
+df = pd.read_table(config['samples']['file'])
+
+## Now set all values as required
+samples = list(set(df['sample']))
+treats = list(set(df['treat']))
+inputs = list(set(df['input']))
+targets = list(set(df['target']))
+n_targets = len(targets)
+
+## Note that the last level in treats can never be the reference level
+wildcard_constraints:
+	target = "(" + '|'.join(targets) + ")",
+	tgt1 = "(" + '|'.join(targets) + ")",
+	tgt2 = "(" + '|'.join(targets) + ")",
+	sample = "(" + '|'.join(samples) + ")",
+	treat = "(" + '|'.join(treats) + ")",
+	ref = "(" + '|'.join(treats) + ")"
+
+###############
+## Key Paths ##
+###############
+annotation_path = os.path.join("output", "annotations")
+bam_path = config['paths']['bam']
+check_path = os.path.join("output", "checks")
+diff_path = os.path.join("output", "differential_signal")
+grey_path = os.path.join("output", "greylist")
+json_path = os.path.join("config", "json")
+macs2_path = os.path.join("output", "macs2")
+nfr_path = os.path.join("output", "nfr")
+pairs_path = os.path.join("output", "pairwise_comparisons")
+peak_path = os.path.join("output", "peak_analysis")
+rmd_path = "analysis"
+log_path = os.path.join("workflow", "logs")
+## Export for easier parsing within each Rmd
+all_paths = {
+	'annotation': annotation_path,
+	'bam': bam_path,
+	'diff_signal': diff_path,
+	'greylist': grey_path,
+	'json': json_path,
+	'macs2': macs2_path,
+	'nfr': nfr_path,
+	'peaks': peak_path,
+	'rmd': rmd_path
+}
+os.makedirs(json_path, exist_ok = True)
+with open(os.path.join(json_path, "all_paths.json"), 'w') as fp:
+	json.dump(all_paths, fp, indent = 4)
+
+
+#######################
+## Update parameters ##
+#######################
+def set_params(config, targets):
+	out = {}
+	for i in targets:
+		out[i] = config['default'].copy()
+		if i in config.keys():
+			for j in config[i].keys():
+				out[i][j] = config[i][j]
+	return(out)
+
+## This should be OK at this point
+diff_sig_param = set_params(config['differential_signal'], targets)
+rm_targets = [] # Holds targets with no valid contrasts
+for i in diff_sig_param.keys():
+	poss_levels = set(df['treat'][df['target'] == i])
+	valid_contrasts = []
+	if diff_sig_param[i]['contrasts']:
+		J = len(diff_sig_param[i]['contrasts'])
+		for j in range(J):
+			supplied = diff_sig_param[i]['contrasts'][j].copy()
+			valid = poss_levels.intersection(supplied)
+			if len(valid) == 2:
+				valid_contrasts.extend([supplied])
+		if len(valid_contrasts):
+			diff_sig_param[i]['contrasts'] = valid_contrasts
+			diff_sig_param[i]['target'] = i
+		else:
+			rm_targets.extend([i])
+	else:
+		rm_targets.extend([i])
+		
+
+if len(rm_targets): # Remove those without valid contrasts
+	for i in rm_targets:
+		del diff_sig_param[i]
+
+with open(os.path.join(json_path, "differential_signal_param.json"), 'w') as fp:
+	json.dump(diff_sig_param, fp, indent = 4)
+
+all_contrasts = []
+if len(diff_sig_param):
+	for i in diff_sig_param.keys():
+		for j in range(len(diff_sig_param[i]['contrasts'])):
+			lv = diff_sig_param[i]['contrasts'][j]
+			cont = i + "_" + lv[0] + "_" + lv[1]
+			all_contrasts.extend([cont])
+
+all_contrasts.sort()
+
+## Turn of all Diff Signal & Pairwise comps by uncommenting this line
+# all_contrasts = []
+
+## use the contrasts to define all pairwise comparisons
+pairs = []
+for p in list(itertools.combinations(all_contrasts, 2)):
+	pairs.extend([p[0] + "-" + p[1]])
+
+## Turn of all Pairwise comps by uncommenting this line
+# pairs = []
+
+## Make sure nfr, pairwise & shared are added to the options for motif analysis
+motif_cats = targets.copy()
+if (len(targets) >1):
+	motif_cats.extend(['shared'])
+
+if set([config['modules']['nfr']]).intersection(targets):
+	motif_cats.extend(['nfr'])
+
+if pairs:
+	motif_cats.extend(['pairwise'])
+
+## Define all pairwise directions for comparisons, excluding both undetected
+pw_dirs = []
+if pairs:
+    dirs = ['increased', 'decreased', 'unchanged', 'undetected']
+    for i in range(4):
+        for j in range(4):
+            pw_dirs.extend([dirs[i] + "_" + dirs[j]])
+    pw_dirs.remove('undetected_undetected')
+
+
+
+# Dump params to json. Might be handy later
+peak_calling_param = set_params(config['peak_calling'], targets)
+with open(os.path.join(json_path, "peak_calling_param.json"), 'w') as fp:
+	json.dump(peak_calling_param, fp, indent = 4)
+
+
+motif_param = set_params(config['motif_analysis'], motif_cats)
+with open(os.path.join(json_path, "motif_analysis_param.json"), 'w') as fp:
+	json.dump(motif_param, fp, indent = 4)
+
+profile_heatmap_param = set_params(config['profile_heatmaps'], targets)
+with open(os.path.join(json_path, "profile_heatmap_param.json"), 'w') as fp:
+	json.dump(profile_heatmap_param, fp, indent = 4)
+
+pairwise_param = set_params(config['pairwise'], pairs)
+with open(os.path.join(json_path, "pairwise_param.json"), 'w') as fp:
+	json.dump(pairwise_param, fp, indent = 4)
+
+#################
+## Figure Type ##
+#################
+rmdconfigfile = "config/rmarkdown.yml"
+rmd_config = yaml.safe_load(open(rmdconfigfile))
+fig_type = rmd_config['knitr_opts']['dev']
+if type(fig_type) is list:
+	fig_type = fig_type[0]
+
+
+###############################
+## External Annotation Files ##
+###############################
+
+## These are required input for multiple steps
+def get_gtf(x):
+	gc_vers = re.findall('[M0-9]+$', x['genome']['gencode'])[0]
+	if x['external']['gtf']:
+		f = x['external']['gtf']
+	else:
+		bld = x['genome']['build'].lower()
+		extra = ''
+		if (bld == 'grch37') | (bld == 'hg19'):
+			extra = 'lift37'
+		f = os.path.join(
+			'data', 'external',
+			'gencode.v' + gc_vers + extra + ".annotation.gtf.gz"
+		)
+	return(f)
+
+gtf = get_gtf(config)
+
+def get_blacklist(x):
+	if x['external']['blacklist']:
+		f = x['external']['blacklist']
+	else:
+		bld = x['genome']['build'].lower()
+		## None is available for mm39
+		pre_map = {
+			'grch37': "hg19", 'grch38': "hg38",
+			'hg19': "hg19", 'hg38': "hg38",
+			'grcm38': 'mm10', 'mm10': 'mm10'
+    	}
+		has_bl = bool(set(pre_map.keys()).intersection([bld]))
+		msg = 'Please supply your own blacklist for ' + x['genome']['build']
+		assert has_bl, msg
+		pre = pre_map[bld]
+		f = os.path.join('data', 'external', pre + '-blacklist.v2.bed.gz')
+	return(f)
+
+blacklist = get_blacklist(config)
+chrom_sizes = os.path.join(annotation_path, "chrom.sizes")
+
+#####################
+## Prepare Outputs ##
+#####################
+ALL_OUTPUTS = []
+
+############
+## Checks ##
+############
+ALL_CHECKS = expand(
+	os.path.join("output", "checks", "{f}.chk"),
+	f = ['args', 'here', 'r-packages']
+)
+
+#####################################
+## Annotations Defined in worfklow ##
+#####################################
+
+## These are dependent on H3K27Ac being a target. If so, promoters, enhancers
+## and super-enhancers will be created. If not, only the tss regions will be
+## created
+ANNOTATION_RDS = expand(
+	os.path.join(annotation_path, "{file}.rds"),
+	file = [
+		'blacklist', 'colours', 
+		'features', 'gene_regions', 
+		'gsea_dir', 'gsea_sig',
+		'gtf', 'hic',
+		'motif_list', 'motif_uri', 'msigdb',
+		'rna', 'seqinfo', 'trans_models','tss', 
+	]
+)
+# diff_sig_rds_pre = []
+# for i in all_contrasts:
+# 	tgt = re.split("_", i)[0]
+# 	diff_sig_rds_pre.extend([tgt + "/" + i])
+#
+# ANNOTATION_RDS.extend(
+# 	expand(
+# 		os.path.join(diff_path, "{f}-differential-signal.rds"), 
+# 		f = diff_sig_rds_pre
+# 	)
+# )
+ALL_OUTPUTS.extend(ANNOTATION_RDS)
+
+#######################
+## Rmarkdown Outputs ##
+#######################
+HTML_OUT = expand(
+	os.path.join("docs", "{file}.html"),
+	file = ['annotation_description']
+)
+
+## Macs2 Summaries
+HTML_OUT.extend(
+	expand(
+		os.path.join("docs", "{target}_signal_summary.html"),
+		target = targets
+	)
+)
+if len(targets) > 1:
+	HTML_OUT.extend([os.path.join("docs", "signal_comparison.html")])
+
+
+## Any NFR modules
+NFR_RDS = []
+if (config['modules']['nfr']):
+	HTML_OUT.extend(
+		expand(
+			os.path.join("docs", "{f}_nfr.html"),
+			f = config['modules']['nfr']
+		)
+	)
+	NFR_RDS.extend(
+		expand(
+			os.path.join(
+				"output", "nfr", "{f}", "{f}_consensus_nfr.rds"
+			),
+			f = config['modules']['nfr']
+		)
+	)
+
+
+## Try bringing in diffsignal again
+if len(diff_sig_param):
+	COUNTS = expand(
+		os.path.join(diff_path, "{target}", "{target}_counts.rds"), 
+		target = targets
+	)
+	ALL_OUTPUTS.extend(COUNTS)
+
+
+# Differential Signal
+# all_contrasts = []
+RMD = expand(
+	os.path.join(rmd_path, "{cont}_differential_signal.Rmd"),
+	cont = all_contrasts
+)
+ALL_OUTPUTS.extend(RMD)
+HTML_OUT.extend(
+	expand(
+		os.path.join("docs", "{cont}_differential_signal.html"),
+		cont = all_contrasts
+	)
+)
+
+## Pairwise Comparisons: Only if required
+HTML_OUT.extend(
+	expand(
+		os.path.join("docs", "{comp}_pairwise_comparison.html"),
+		comp = pairs
+	)
+)
+
+
+ALL_OUTPUTS.extend(HTML_OUT)
+## Keep the final index separate for easier passing to other rules
+ALL_OUTPUTS.extend([os.path.join("docs", "index.html")])
+
+## Consensus Peaks
+CONS_PEAKS = expand(
+	os.path.join(peak_path, "{target}", "{target}_consensus_peaks.bed.gz"),
+	target = targets,
+)
+ALL_OUTPUTS.extend(CONS_PEAKS)
+
+
+###########################
+## Peak Files from macs2 ##
+###########################
+INDIV_PEAKS = expand(
+	os.path.join(macs2_path, "{sample}", "{sample}_peaks.narrowPeak"),
+	sample = samples
+)
+ALL_OUTPUTS.extend(INDIV_PEAKS)
+df['merged_pre'] = df[['target', 'treat']].agg('_'.join, axis = 1)
+merged_pre = set(df[['target', 'merged_pre']].agg('/'.join, axis = 1))
+MERGED_PEAKS = expand(
+	os.path.join(macs2_path, "{pre}_merged_peaks.narrowPeak"),
+	pre = merged_pre
+)
+ALL_OUTPUTS.extend(MERGED_PEAKS)
+
+
+##################
+## BigWig Files ##
+##################
+# These are required for signal summary. All others are handled within rules
+MERGED_BW = expand(
+	os.path.join(macs2_path, "{path}_merged_treat_pileup.bw"),
+	path = merged_pre
+)
+ALL_OUTPUTS.extend(MERGED_BW)
+
+rule all:
+	input:
+		ALL_OUTPUTS
+
+include: "rules/downloads.smk"
+include: "rules/initial_checks.smk"
+include: "rules/annotations.smk"
+include: "rules/make_greylist.smk"
+include: "rules/samtools.smk"
+
+if config['modules']['nfr']:
+	include: "rules/nfr.smk"
+
+include: "rules/macs2.smk"
+include: "rules/consensus_peaks.smk"
+
+if len(targets) > 1:
+	include: "rules/shared_peaks.smk"
+
+include: "rules/bigwig.smk"
+include: "rules/regioner.smk"
+include: "rules/motif_analysis.smk"
+
+if len(diff_sig_param):
+	include: "rules/differential_signal.smk"
+
+if len(pairs):	
+	include: "rules/pairwise_comparisons.smk"
+
+include: "rules/create_rmd.smk"
+include: "rules/compile_rmd.smk"

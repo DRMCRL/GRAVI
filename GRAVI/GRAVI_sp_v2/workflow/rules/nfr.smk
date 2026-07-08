@@ -1,0 +1,234 @@
+rule merge_nearby_peaks:
+    input:
+        packages = rules.check_r_packages.output,
+        peaks = os.path.join(
+            peak_path, "{target}", "{target}_{treat}_filtered_peaks.narrowPeak"
+        ),
+        script = os.path.join("workflow", "scripts", "merge_filtered_peaks.R"),
+    output:
+        bed = os.path.join(
+            nfr_path, "{target}", "{target}_{treat}_merged_peaks.bed"
+        )
+    params:
+        within = nfr_params['merge_peaks_within']
+    threads: 1
+    resources:
+        mem_mb = 8192,
+        runtime = "5m"
+    log: os.path.join(log_path, "merge_filtered_peaks", "{target}_{treat}.log")
+    conda: "../envs/rmarkdown.yml"
+    script:
+        "../scripts/merge_filtered_peaks.R"
+
+#this rule is added to remove too narrow ATAC peaks that might crash NFR step below. In og version this rule doesn't exist, and input of call_nfr is []_merged_peaks.bed
+rule filter_nfr_peaks:
+    input:
+        os.path.join(
+            nfr_path, "{target}", "{target}_{treat}_merged_peaks.bed")
+    output:
+        os.path.join(
+            nfr_path, "{target}", "{target}_{treat}_merged_peaks_min200.bed")
+    shell:
+        """
+        awk '($3-$2)>=200' {input} > {output}
+        """
+
+rule call_nfr:
+    input:
+        bdg = os.path.join(
+            macs2_path, "{target}", "{target}_{treat}_merged_treat_pileup.bdg"
+        ),
+        bed =  os.path.join(
+            nfr_path, "{target}", "{target}_{treat}_merged_peaks_min200.bed"
+        ),
+        script = os.path.join("workflow", "scripts", "HisTrader.pl")
+    output:
+        nfr = temp(
+            os.path.join(nfr_path, "{target}", "{target}_{treat}.nfr.bed")
+        ),
+    params:
+        pre = os.path.join(nfr_path, "{target}", "{target}_{treat}"),
+        p_max = nfr_params['p_max'],
+        max_nfr = max(nfr_params['nfr_width']),
+        min_size = nfr_params['min_peak_width'],
+    threads: 1
+    resources:
+        mem_mb = 8192,
+        runtime = "1h"
+    shadow: 'minimal'
+    log: os.path.join(log_path, "call_nfr", "{target}_{treat}.log")
+    shell:
+        """
+        perl {input.script} \
+          --bedGraph {input.bdg} \
+          --peaks {input.bed} \
+          --pMax {params.p_max} \
+          --minSize {params.min_size} \
+          --filter {params.max_nfr} \
+          --out {params.pre} > {log}
+        """
+
+rule strip_bed:
+    input: "{f}.bed"
+    output: "{f}.bed.gz"
+    threads: 1
+    localrule: True
+    resources:
+        runtime = "5m",
+        mem_mb = 2048
+    shell:
+        """
+        cut -f1-3 {input} | gzip -c > {output}
+        """
+
+rule make_consensus_nfr:
+    input:
+        blacklist = rules.prep_blacklist.output.blacklist, 
+        features = rules.prep_features.output.rds, 
+        gtf = rules.create_genome_annotations.output.gtf,
+        greylist = rules.combine_greylists.output.rds,
+        hic = rules.prep_hic.output.hic, 
+        packages = rules.check_r_packages.output,
+        peaks = lambda wildcards: expand(
+            os.path.join(
+                nfr_path, "{{target}}", "{{target}}_{treat}.nfr.bed.gz"
+            ),
+            treat = set(df[df.target == wildcards.target]['treat'])
+        ),
+        qc = os.path.join(macs2_path, "{target}", "{target}_qc_samples.tsv"),
+        regions = rules.create_genome_annotations.output.regions, 
+        script = os.path.join("workflow", "scripts", "make_consensus_peaks.R"),
+        sq = rules.create_genome_annotations.output.seqinfo, 
+        yaml = os.path.join("config", "params.yml"),
+    output:
+        bed = os.path.join(
+            nfr_path, "{target}", "{target}_consensus_nfr.bed.gz"
+        ),
+        rds = os.path.join(
+            nfr_path, "{target}", "{target}_consensus_nfr.rds"
+        )
+    params:
+        ## Passed to makeConsensus. This will give stringent, shared NFRs
+        method = 'coverage',
+        min_width = min(nfr_params['nfr_width']),
+        p = 1,
+        peak_type = "bed",
+        merge_within = nfr_params['merge_nfrs_within']
+    conda: "../envs/rmarkdown.yml"
+    threads: 1
+    log: os.path.join(log_path, "make_consensus_peaks", "{target}_nfr.log")
+    resources:
+        mem_mb = 4096,
+        runtime = "10m"
+    script:
+        "../scripts/make_consensus_peaks.R"
+
+rule nfr_motif_analysis:
+    input:
+        arg_checks = rules.check_args.output,
+        exclude_ranges = rules.make_exclude_ranges.output.rds,
+	n_masked_ranges = rules.make_n_masked_ranges.output.rds, # added since this was missing in og
+        gene_regions = rules.create_genome_annotations.output.regions, 
+        motifs = rules.prep_motifs.output.motifs,
+        packages = rules.check_r_packages.output,
+        peaks = os.path.join(
+            nfr_path, "{target}", "{target}_consensus_nfr.rds"
+        ),
+        script = os.path.join("workflow", "scripts", "motif_analysis.R"),
+    output:
+        enrich = os.path.join(
+            nfr_path, "{target}", "{target}_motif_enrichment.tsv.gz"
+        ),
+        pos = os.path.join(
+            nfr_path, "{target}", "{target}_motif_position.tsv.gz"
+        ),
+    params:
+        motif_params = motif_param['nfr']
+    threads: lambda wildcards, attempt: attempt * 8
+    retries: 2
+    resources:
+        disk_mb = 10000,
+        mem_mb = lambda wildcards, attempt: attempt * 64000,
+        runtime = lambda wildcards, attempt: attempt * 120,
+    log: os.path.join(log_path, "motif_analysis", "{target}_nfr_motif_analysis.log")
+    conda: "../envs/rmarkdown.yml"
+    script:
+        "../scripts/motif_analysis.R"
+
+rule nfr_localz_regions:
+    input:
+        arg_checks = rules.check_args.output,
+        features = rules.prep_features.output.rds, 
+        packages = rules.check_r_packages.output,
+        peaks = os.path.join(
+            nfr_path, "{target}", "{target}_consensus_nfr.bed.gz"
+        ),
+        regions = rules.create_genome_annotations.output.regions, 
+        script = os.path.join(
+            "workflow", "scripts", "regioner_localz_regions.R"
+        ),
+    output:
+        rds = os.path.join(
+            nfr_path, "{target}", "{target}_nfr_regions_localz.rds"
+        )
+    params:
+        regioner_params = extra_params['regioner']        
+    threads: 8
+    retries: 1
+    resources:
+        mem_mb = 32768,
+        runtime = "60m",
+    log: os.path.join(log_path, "regioner", "{target}_nfr_regions_localz.log")
+    conda: "../envs/rmarkdown.yml"
+    script:
+        "../scripts/regioner_localz_regions.R"
+
+def get_nfr_peaks_for_local_z(wildcards):
+    tgts = set(targets).difference(set([wildcards.target]))
+    peaks = []
+    peaks.extend(
+        expand(
+            os.path.join(nfr_path, "{t}", "{t}_consensus_nfr.bed.gz"),
+            t = [wildcards.target]
+        )
+    )
+    peaks.extend(
+        expand(
+            os.path.join(peak_path, "{t}", "{t}_consensus_peaks.bed.gz"),
+            t = set(targets).difference(set([wildcards.target]))
+        )
+    )
+    return(peaks)
+
+
+rule nfr_localz_targets:
+    input:
+        arg_checks = rules.check_args.output,
+        packages = rules.check_r_packages.output,
+        peaks = get_nfr_peaks_for_local_z,
+        script = os.path.join(
+            "workflow", "scripts", "regioner_localz_targets.R"
+        ),
+        sq = rules.create_genome_annotations.output.seqinfo, 
+    output:
+        rds = os.path.join(
+            nfr_path, "{target}", "{target}_nfr_targets_localz.rds"
+        )
+    params:
+        regioner_params = extra_params['regioner']        
+    threads: 16
+    retries: 1
+    resources:
+        mem_mb = 65536,
+        runtime = lambda wildcards, attempt: 120 * attempt,
+    log: os.path.join(log_path, "regioner", "{target}_nfr_targets_localz.log")
+    conda: "../envs/rmarkdown.yml"
+    script:
+        "../scripts/regioner_localz_targets.R"
+
+# It should be possible to use the output of shared_targets_localz so that
+# targets are only compared to the NFR loci, not to each other, as that's 
+# already been done. The above script may need a quick rewrite though.
+# A good option may be to write the script so that only the first (i.e. NFR)
+# set of peaks is compared to the other peaks, although that might not work
+# for multiple targets with NFRs. This will save quite a few CPU hours on an HPC

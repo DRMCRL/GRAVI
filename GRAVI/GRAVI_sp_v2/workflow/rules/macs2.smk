@@ -1,0 +1,201 @@
+rule macs2_individual:
+    input:
+        bam = os.path.join(bam_path, "{sample}.bam"),
+        bai = os.path.join(bam_path, "{sample}.bam.bai"),
+        control = lambda wildcards: expand(
+            os.path.join(bam_path, "{ctrl}.{suffix}"),
+            ctrl = set(df[df['sample'] == wildcards.sample]['input']),
+            suffix = ['bam', 'bam.bai']
+        ),
+    output:
+        narrow_peaks = os.path.join(
+            macs2_path, "{sample}", "{sample}_peaks.narrowPeak"
+        ),
+        bedgraph = temp(
+            os.path.join(macs2_path, "{sample}", "{sample}_treat_pileup.bdg"),
+        ),
+        log = os.path.join(macs2_path, "{sample}", "{sample}_callpeak.log"),
+        summits = os.path.join(macs2_path, "{sample}", "{sample}_summits.bed"),
+    log: os.path.join(log_path, "macs2_individual", "{sample}.log")
+    conda: "../envs/macs2.yml"
+    shadow: 'minimal'
+    params:
+        outdir = os.path.join(macs2_path, "{sample}"),
+        gsize = lambda wildcards: peak_calling_param[
+            list(df[df['sample'] == wildcards.sample]['target'])[0]
+        ]['gsize'],
+        fdr = lambda wildcards: peak_calling_param[
+            list(df[df['sample'] == wildcards.sample]['target'])[0]
+        ]['fdr'],
+        keep_dup = lambda wildcards: peak_calling_param[
+            list(df[df['sample'] == wildcards.sample]['target'])[0]
+        ]['keep_duplicates'],
+        extra = lambda wildcards: peak_calling_param[
+            list(df[df['sample'] == wildcards.sample]['target'])[0]
+        ]['macs2_extra']
+    threads: 1
+    resources:
+        mem_mb = 8192,
+# ChIP version:
+#     -c {input.control[0]} \
+# Removed for ATAC testing (no matched input control). In normal use add this to macs2 callpeak chunk below
+    shell:
+        """
+        macs2 callpeak \
+            -t {input.bam} \
+            -f BAM \
+            -g {params.gsize} \
+            --keep-dup {params.keep_dup} \
+            -q {params.fdr} \
+            -n {wildcards.sample} \
+            --bdg --SPMR \
+            {params.extra} \
+            --outdir {params.outdir} 2> {log}
+        cp {log} {output.log}
+        """
+
+rule peak_qc:
+    input:
+        bam = lambda wildcards: expand(
+            os.path.join(bam_path, "{sample}.bam"),
+            sample = set(df[df.target == wildcards.target]['sample']),
+        ),
+        blacklist = rules.prep_blacklist.output.blacklist, 
+        greylist = rules.combine_greylists.output.rds,
+        input_bam = lambda wildcards: expand(
+            os.path.join(bam_path, "{sample}.bam"),
+            sample = set(df[df.target == wildcards.target]['input']),
+        ),
+        logs = lambda wildcards: expand(
+            os.path.join(macs2_path, "{sample}", "{sample}_callpeak.log"),
+            sample = set(df[df.target == wildcards.target]['sample']),
+        ),
+        packages = rules.check_r_packages.output,   
+        peaks = lambda wildcards: expand(
+            os.path.join(macs2_path, "{sample}", "{sample}_peaks.narrowPeak"),
+            sample = set(df[df.target == wildcards.target]['sample']),
+        ),
+        seqinfo = rules.create_genome_annotations.output.seqinfo, 
+        gene_regions = rules.create_genome_annotations.output.regions, 
+    output:
+        cors = os.path.join(
+            macs2_path, "{target}", "{target}_cross_correlations.tsv"
+        ),
+        qc = os.path.join(macs2_path, "{target}", "{target}_qc_samples.tsv"),
+    params:
+        allow_zero = lambda wildcards: peak_calling_param[wildcards.target]['allow_zero'],
+        outlier_threshold = lambda wildcards: peak_calling_param[wildcards.target]['outlier_threshold']
+    conda: "../envs/rmarkdown.yml"
+    threads: lambda wildcards: len(df[df['target'] == wildcards.target])
+    retries: 1
+    resources:
+        mem_mb = 16384,
+    log: os.path.join(log_path, "peak_qc", "{target}_peak_qc.log")
+    script:
+        "../scripts/peak_qc.R"
+
+rule macs2_merged:
+    input:
+        bam = lambda wildcards: expand(
+            os.path.join(bam_path, "{f}.bam"),
+            f = set(
+                df[(df.treat == wildcards.treat) & (df.target == wildcards.target)]['sample']
+            )
+        ),
+        bai = lambda wildcards: expand(
+            os.path.join(bam_path, "{f}.bam.bai"),
+            f = set(
+                df[(df.treat == wildcards.treat) & (df.target == wildcards.target)]['sample']
+            )
+        ),
+        input = lambda wildcards: expand(
+            os.path.join(bam_path, "{f}.{suffix}"),
+            f = set(
+                df[(df.treat == wildcards.treat) & (df.target == wildcards.target)]['input']
+            ),
+            suffix = ['bam', 'bam.bai']
+        ),
+        qc = os.path.join(macs2_path, "{target}", "{target}_qc_samples.tsv")
+    output:
+        peaks = os.path.join(
+            macs2_path, "{target}", "{target}_{treat}_merged_peaks.narrowPeak"
+        ),
+        summits = os.path.join(
+            macs2_path, "{target}", "{target}_{treat}_merged_summits.bed"
+        ),
+        bedgraph = temp(
+            expand(
+                os.path.join(
+                    macs2_path, "{{target}}", "{{target}}_{{treat}}_merged_{type}.bdg"
+                ),
+                type = ['treat_pileup', 'control_lambda']
+            )
+        ),
+        log = os.path.join(
+            macs2_path, "{target}", "{target}_{treat}_merged_callpeak.log"
+        )
+    shadow: 'shallow'
+    log: os.path.join(log_path, "macs2_merged", "{target}_{treat}_merged.log")
+    conda: "../envs/macs2.yml"
+    params:
+        bamdir = bam_path,
+        outdir = os.path.join(macs2_path, "{target}"),
+        prefix = "{target}_{treat}_merged",
+        gsize = lambda wildcards: peak_calling_param[wildcards.target]['gsize'],
+        fdr = lambda wildcards: peak_calling_param[wildcards.target]['fdr'],
+        keep_dup = lambda wildcards: peak_calling_param[wildcards.target]['keep_duplicates'],
+        extra = lambda wildcards: peak_calling_param[wildcards.target]['macs2_extra']
+    threads: 1
+    resources:
+        mem_mb = 8192	
+    shell:
+        """
+        QC_PASS=$(egrep 'pass' {input.qc} | egrep {wildcards.treat} | cut -f1)
+        SAMPLES=$(for f in $QC_PASS; do echo {params.bamdir}/$f.bam; done)
+
+        ## Get the input column
+        I=$(head -n1 {input.qc} | sed -r 's/\\t/\\n/g' | egrep -n '[Ii]nput' | sed -r 's/([0-9]+):[Ii]nput/\\1/g')
+        INPUT_PASS=$(egrep 'pass$' {input.qc} | egrep "{wildcards.treat}\s" | cut -f$I | uniq)
+        INPUT=$(for f in $INPUT_PASS; do echo {params.bamdir}/$f.bam; done)
+
+        macs2 callpeak \
+            -t $SAMPLES\
+            -c $INPUT \
+            -f BAM \
+            -g {params.gsize} \
+            --keep-dup {params.keep_dup} \
+            -q {params.fdr} \
+            -n {params.prefix} \
+            --bdg --SPMR \
+            {params.extra} \
+            --outdir {params.outdir} 2> {log}
+        cp {log} {output.log}
+        """
+
+rule macs2_bdgcmp:
+    input:
+        bdg = os.path.join(
+            macs2_path, "{target}", "{target}_{treat}_merged_treat_pileup.bdg"
+        ),
+        ctrl = os.path.join(
+            macs2_path, "{target}", "{target}_{treat}_merged_control_lambda.bdg"
+        ),
+    output:
+        temp(
+            os.path.join(macs2_path, "{target}/{target}_{treat}_merged_FE.bdg"),
+        )
+    log: os.path.join(log_path, "macs2_bdgcmp", "{target}", "{target}_{treat}_bdgcmp.log")
+    conda: "../envs/macs2.yml"
+    threads: 1
+    resources:
+        mem_mb = 16384,
+        runtime = "3h"
+    shell:
+        """
+        macs2 bdgcmp \
+            -t {input.bdg} \
+            -c {input.ctrl} \
+            -m FE \
+            -o {output} 2> {log}
+        """		
+        

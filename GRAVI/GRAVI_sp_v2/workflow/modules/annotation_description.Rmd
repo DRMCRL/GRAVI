@@ -1,0 +1,977 @@
+
+```{r set-knitr-opts, echo=FALSE, child = here::here('analysis/setup_chunk.Rmd')}
+```
+
+```{r packages}
+library(tidyverse)
+library(magrittr)
+library(rtracklayer)
+library(glue)
+library(pander)
+library(scales)
+library(yaml)
+library(reactable)
+library(htmltools)
+library(plyranges)
+library(GenomicInteractions)
+library(extraChIPs)
+library(GenomeInfoDb)
+library(universalmotif)
+library(patchwork)
+library(ggrepel)
+panderOptions("big.mark", ",")
+panderOptions("missing", "")
+panderOptions("table.split.table", Inf)
+theme_set(
+  theme_bw() +
+    theme(plot.title = element_text(hjust = 0.5))
+)
+```
+
+```{r config}
+config <- read_yaml(here::here("config", "config.yml"))
+all_paths <- here::here("config", "json", "all_paths.json") %>% 
+    jsonlite::fromJSON()
+all_out <- lapply(params, here::here)
+enrich_params <- read_yaml(here::here("config", "params.yml")) %>%
+  pluck("enrichment")
+mapping_params <- read_yaml(here::here("config", "params.yml")) %>%
+  pluck("mapping")
+motif_params <- read_yaml(here::here("config", "params.yml")) %>%
+  pluck("motifdb")
+msigdb_params <- read_yaml(here::here("config", "params.yml")) %>%
+  pluck("msigdb")
+region_params <- read_yaml(here::here("config", "params.yml")) %>%
+  pluck("gene_regions")
+all_heat_params <- here::here("config", "json", "profile_heatmap_param.json") %>% 
+  jsonlite::fromJSON() 
+dsa_params <- here::here("config", "json", "differential_signal_param.json") %>% 
+  jsonlite::fromJSON() 
+pw_params <- here::here("config", "json", "pairwise_param.json") %>% 
+  jsonlite::fromJSON() 
+source(here::here("scripts", "custom_functions.R"))
+source(here::here("scripts", "table_funs.R"))
+```
+
+```{r colours}
+colours <- read_yaml(here::here("config", "colours.yml"))
+treat_levels <- config$comparisons$contrasts %>% 
+  unlist() %>% 
+  unique()
+samples <- here::here(config$samples$file) %>%
+  read_tsv() %>% 
+  mutate(
+    treat = factor(treat, levels = unique(c(treat_levels, treat))),
+    target = as.factor(target)
+  )
+targets <- unique(samples$target)
+treat_levels <- levels(samples$treat)
+has_external <- length(config$external$coverage) > 0
+if (has_external) {
+  treat_levels <- c(
+    treat_levels,
+    lapply(config$external$coverage, names) %>% unlist()
+  ) %>% 
+    unique()
+}
+rna <- read_rds(all_out$rna)
+has_rna <- length(rna) > 0
+```
+
+```{r fig-params, results='hide'}
+fig_params <- here::here("config", "rmarkdown.yml") %>% 
+  read_yaml() %>% 
+  pluck("knitr_opts")
+fw <- fig_params$fig.width
+fh <- fig_params$fig.height
+fig_type <- fig_params$dev[[1]]
+if (is.null(fig_type)) stop("Couldn't detect figure type")
+fig_fun <- match.fun(fig_type)
+if (fig_type %in% c("bmp", "jpeg", "png", "tiff")) {
+  ## These figure types require dpi & resetting to be inches
+  formals(fig_fun)$units <- "in"
+  formals(fig_fun)$res <- 300
+}
+fig_path <- here::here("docs", "assets", "annotations")
+```
+
+## External Files Provided
+
+The files provided as external data for this workflow are:
+
+# theres a pander line in this section that has been removed. hashing out the line didn't remove its readthrough, which leads to error if config$external is empty. original line can be found in Stevie's original script.
+## Genome Annotations
+
+Before analysing any datasets, annotations for the genome and transcriptome were checked and key objects were defined for consistent use throughout the workflow.
+
+### Genome Description
+
+```{r sq}
+sq <- read_rds(all_out$seqinfo)
+```
+
+As the foundation for all annotation objects, the description of the underlying genome is required as a `Seqinfo` object.
+For this workflow, both the mitochondrial genome and any scaffolds are excluded, giving only the autosomes and the X/Y chromosomes.
+This `Seqinfo` object is added to all subsequent objects requiring information about the underlying genome, such as a `GenomicRanges` object.
+
+### Blacklisted Regions {.tabset}
+
+Blacklisted regions were supplied in `r pander(unname(unlist(all_out$blacklist)))`.
+In addition, grey-listed regions were derived from all the input `r ifelse(length(unique(samples$input)) == 1, "sample", "samples")`, `r pander(unique(samples$input))`
+
+```{r blacklist}
+bl <- unlist(all_out$blacklist) %>% 
+  here::here() %>% 
+  importPeaks(type = "bed", seqinfo = sq) 
+gl <- read_rds(all_out$greylist)
+exclude_ranges <- c(bl, gl)
+```
+
+#### Similarity Between Black & Grey Lists
+
+```{r plot-excluded-ranges, fig.width = ifelse(length(exclude_ranges) > 2, fw, fh), fig.cap = "Number of regions identified as blacklisted"}
+exclude_ranges %>% 
+  plotOverlaps(
+    type = ifelse(length(.) > 2, "upset", "venn"),
+    set_col = seq_along(exclude_ranges)
+  )
+```
+
+
+#### Breakdown By Chromosome
+
+```{r plot-blacklist, fig.height = 7, fig.cap = "*Breakdown of blacklisted, greylisted and whitelisted, regions by chromosome. If multiple input samples were provided, greylisted regions will be variable across samples.*"}
+exclude_ranges %>% 
+  unlist() %>% 
+  names_to_column("source") %>% 
+  reduceMC() %>% 
+  mutate(
+    source = map_lgl(
+      source, 
+      \(x) any(basename(all_out$blacklist) %in% as.character(x))
+    ),
+    source = ifelse(source, "blacklisted", "greylisted")
+  ) %>% 
+  c(
+    setdiff(GRanges(sq), .) %>% mutate(source = "whitelisted")
+  ) %>% 
+  sort() %>% 
+  select(source) %>% 
+  as_tibble(rangeAsChar = FALSE) %>% 
+  mutate(
+    seqnames = fct_rev(seqnames),
+    ymin = as.integer(seqnames) - 0.35, ymax = as.integer(seqnames) + 0.35,
+    source = str_to_title(source)
+  ) %>% 
+  ggplot(aes(fill = source)) +
+  geom_rect(
+    aes(xmin = start, xmax = end, ymin = ymin, ymax = ymax)
+  ) +
+  scale_x_continuous(expand = expansion(c(0.01, 0.01)), labels = comma_format(scale = 1e-6)) +
+  scale_y_continuous(
+    expand = expansion(c(0.02, 0.02)), labels = rev(seqnames(sq)), 
+    breaks = seq_along(seqnames(sq))
+  ) +
+  scale_fill_manual(
+    values = c(
+      Whitelisted = "lightblue", Greylisted = "grey", Blacklisted = "black"
+    )
+  ) +
+  labs(x = "Chromosome Position (MB)", fill = "Status") +
+  theme_classic() +
+  theme(
+    legend.position = "inside",
+    legend.position.inside = c(0.9, 0.15)
+  )
+```
+
+
+## Gene and Transcript Annotations
+
+### Basic Annotations
+
+```{r load-gtf}
+gtf <- read_rds(all_out$gtf)
+id2gene <- setNames(gtf$gene$gene_name, gtf$gene$gene_id) %>% 
+  .[!duplicated(names(.))]
+```
+
+- The complete set of genes, transcripts and exons was loaded from the supplied `gtf` (`r metadata(gtf)$source`), excluding mitochondrial features.
+- The previously generated `Seqinfo` was also placed as the foundation of this annotation object, ensuring this propagates through all subsequent objects
+- Version numbers were removed from all gene, transcript and exon identifiers for convenience, with the minimal set of columns (`r pander(colnames(mcols(gtf$gene)))`) retained.
+- Visualisation using the Bioconductor package `Gviz` requires a specific `GRanges` structure for gene and transcript models to be displayed.
+This object was created at this point so transcript models could be simply visualised throughout the workflow.
+
+In total the annotations provided contained `r comma(length(gtf$gene))` genes, `r comma(length(gtf$transcript))` transcripts and `r comma(length(gtf$exon))` exons, after restricting the dataset to the autosomes and sex chromosomes, discarding scaffolds, haplotypes and mitochondrial genes.
+
+
+### Gene-Centric Regions {.tabset}
+
+
+```{r define-region-colours}
+gene_regions <- read_rds(all_out$gene_regions)
+regions <- vapply(gene_regions, function(x) unique(x$region), character(1))
+missing_reg_col <- setdiff(names(regions), names(colours$regions))
+if (length(missing_reg_col)) {
+  def_reg_cols <- c(
+    promoter = "#FF0000", upstream_promoter = "#FF8500", exon = "#54FF9F", 
+    intron = "#006400", proximal_intergenic = "#4682B4", distal_intergenic = "#0000CD",
+    gene_body = "#008000", intergenic = "#27408B"
+  )
+  colours$regions[missing_reg_col] <- def_reg_cols[missing_reg_col]
+}
+colours$regions <- colours$regions[names(regions)]
+region_cols <- unlist(colours$regions)[names(regions)] %>% 
+  setNames(regions[names(.)])
+```
+
+
+Using the provided GTF **unique** and **non-overlapping** gene and transcript-centric features were defined using `defineRegions()`, and will be treated as annotated regions throughout the workflow.
+The definition of these regions can be easily modified using `params.yml` to suit user-preferred definitions, with clear descriptions of the method given in the help page available at `?extraChIPs::defineRegions`
+
+The defined regions are:
+
+1. Promoters (-`r region_params$promoters$upstream`/+`r region_params$promoters$downstream`bp)
+2. Upstream Promoters (> `r region_params$promoters$upstream`bp; < `r region_params$upstream`bp)
+`r ifelse(region_params$intron, "3. Exons\n4. Introns\n", "3. Gene Body\n")`
+`r ifelse(region_params$proximal == 0, glue("5. Intergenic regions not already assigned as an upstream promoter"), glue("5. Proximal Intergenic\n6. Distal Intergenic (> {region_params$proximal/1e3}kb from a gene)"))`
+
+Colours were also defined for each of these regions for consistent visualisation.
+
+In addition, TSS regions were defined as a separate object given each TSS has single-base width. 
+With the exception of TSS and Promoters, these features were non-overlapping and defined in a hierarchical, un-stranded manner.
+*TSS* regions represent the individual start sites for each transcript, and given that many transcripts can originate from the same TSS, this is somewhat smaller than the number of actual transcripts defined in the GTF.
+
+
+```{r tab-regions}
+cp <- em(
+  glue(
+    "
+  Summary of gene-centric regions defined as a key annotation set. 
+  Colours used throughout the workflow for each region are indicated in the 
+  first column, with other summary statistics making up the rest of the table.
+  "
+  )
+)
+tbl <- gene_regions %>% 
+  lapply(
+    function(x){
+      tibble(
+        n = length(x),
+        width = sum(width(x)), 
+        region = unique(x$region)
+      )
+    }
+  ) %>%
+  bind_rows() %>% 
+  mutate(
+    width = width / 1e6,
+    mn = 1e3*width/n,
+    region = fct_inorder(region),
+    `% Genome` = width / sum(width),
+  ) %>% 
+  rename_all(str_to_title) %>% 
+  mutate(Guide = region_cols[Region]) %>% 
+  dplyr::select(
+    Guide, Region, N, Width, Mn, `% Genome`
+  ) %>% 
+  reactable(
+    searchable = FALSE, filterable = FALSE,
+    columns = list(
+      Guide = colDef(
+        maxWidth = 50,
+        style = function(value) list(background = value),
+        cell = function(value) "",
+        name = ""
+      ),
+      Region = colDef(minWidth = 200),
+      N = colDef(
+        maxWidth = 150,
+        cell = function(value) comma(value, 1)
+      ),
+      Width = colDef(
+        name = "Total Width (Mb)",
+        cell = function(value) sprintf("%.1f", value)
+      ),
+      Mn = colDef(
+        name = "Average Width (kb)",
+        cell = function(value) sprintf("%.2f", value)
+      ),
+      "% Genome" = colDef(
+        cell = function(value) percent(value, 0.1)
+      )
+    )
+  )
+div(class = "table",
+  div(class = "table-header",
+      div(class = "caption", cp),
+      tbl
+  )
+)
+```
+
+#### Summary
+
+```{r pie-gene-regions, fig.height=8, fig.width=8, fig.cap = "*Summary of gene-centric regions using `defineRegions()` and the supplied GTF. Percentages represent the amount of the genome allocated to each region with total widths shown in Mb. Blacklisted regions were not considered for this step of the annotation.*"}
+gene_regions %>% 
+  lapply(select, region) %>% 
+  GRangesList() %>% 
+  unlist() %>% 
+  mutate(region = factor(region, levels = regions)) %>% 
+  setNames(NULL) %>%
+  plotPie(
+    fill = "region", scale_by = "width", scale_factor = 1e6,
+    total_glue = "{comma(N, 0.1)}Mb", total_size = 4.5,
+    cat_glue = "{str_wrap(.data[[fill]], 10)}\n{comma(n, 0.1)}Mb\n({percent(p, 0.1)})",
+    cat_alpha = 0.8, cat_adj = 0.1, cat_size = 3.5
+  ) +
+  scale_fill_manual(values = region_cols) +
+  theme(legend.position = "none")
+```
+
+#### Example
+
+```{r example-id}
+id <- sort(gtf$gene$gene_id)[[1]]
+```
+
+
+```{r plot-example, fig.height=7, fig.cap = paste("*12kb region surrounding", collapseGenes(subset(gtf$gene, gene_id == id)$gene_name), "showing all annotated regions. Given the multiple possible TSS much of the region around these has been merged into a single region which has the capacity to function as a promoter, along with any upstream promoters.*")}
+gr <- subset(gtf$gene, gene_id == id) %>% 
+  resize(width = width(.) + 2.4e4, fix = 'center') %>% 
+  unstrand()
+ft <- gene_regions %>% 
+  lapply(subsetByOverlaps, gr) %>% 
+  lapply(select, region) %>% 
+  lapply(intersectMC, gr) %>% 
+  GRangesList() %>% 
+  unlist() %>% 
+  setNames(c()) %>% 
+  subset(region != "TSS") %>% 
+  sort()
+df <- list(
+  gtf$transcript %>% 
+    subsetByOverlaps(gr) %>% 
+    as_tibble(rangeAsChar = FALSE),
+  gtf$exon %>% 
+    subsetByOverlaps(gr) %>% 
+    as_tibble(rangeAsChar = FALSE) 
+) %>% 
+  bind_rows() %>% 
+  mutate(
+    transcript_name = as.factor(transcript_name)
+  )
+df %>% 
+  ggplot(aes(x = start, y = as.integer(transcript_name))) +
+  geom_rect(
+    aes(
+      xmin = start, xmax = end,
+      ymin =  0, ymax =  Inf,
+      fill = region
+    ),
+    data = ft %>%
+      as.data.frame() %>% 
+      mutate(region = fct_inorder(region) ),
+    inherit.aes = FALSE,
+    alpha = 0.6
+  ) +
+  geom_segment(
+    aes(
+      x = start, xend = end, 
+      y = as.integer(transcript_name),
+      yend = as.integer(transcript_name)
+    ),
+    data = . %>% 
+      dplyr::filter(type == "transcript")
+  ) +
+  geom_segment(
+    aes(
+      x = mid, xend = mid_offset, 
+      y = as.integer(transcript_name),
+      yend = as.integer(transcript_name)
+    ),
+    data = gtf$transcript %>% 
+      subsetByOverlaps(gr) %>% 
+      select(transcript_name) %>% 
+      setdiffMC(gtf$exon) %>%
+      as.data.frame() %>% 
+      mutate(transcript_name = vctrs::vec_proxy(transcript_name)) %>% 
+      unnest(transcript_name) %>% 
+      dplyr::filter(width > 600) %>% 
+      mutate(
+        mid = end - 0.5*width,
+        mid_offset = ifelse(strand == "+", mid + 50, mid - 50),
+        transcript_name = factor(transcript_name, levels = levels(df$transcript_name))
+      ),
+    arrow = arrow(angle = 40, length = unit(0.015, "npc"))
+  ) +
+  geom_rect(
+    aes(
+      xmin = start, xmax = end, 
+      ymin = as.integer(transcript_name) - 0.2, 
+      ymax = as.integer(transcript_name) + 0.2
+    ),
+    data = . %>% 
+      dplyr::filter(type == "exon"),
+    fill = "blue", colour = "blue"
+  ) +
+  coord_cartesian(xlim = c(start(gr), end(gr))) +
+  scale_x_continuous(
+    labels = comma, expand = expansion(c(0, 0))
+  ) +
+  scale_y_continuous(
+    breaks = seq_along(levels(df$transcript_name)),
+    labels = levels(df$transcript_name),
+    expand = expansion(c(-0.05, 0.05))
+  ) +
+  scale_fill_manual(values = region_cols) + 
+  labs(
+    x = as.character(seqnames(gr)), y = "Transcript", fill = "Feature"
+  ) +
+  theme(panel.grid = element_blank())
+```
+
+### Mapping Detected Signal to Genes
+
+```{r get-map-by-feature-args, echo=FALSE}
+map_by_feature_args <- formals(mapByFeature)
+map_by_feature_args[names(mapping_params)] <- mapping_params
+map_by_feature_args <- map_by_feature_args[map_lgl(map_by_feature_args, is, "atomicVector")]
+```
+
+
+Any peaks or other regions containing signal will be automatically mapped to genes using the data provided in the GTF, and additional annotations.
+This becomes especially relevant if providing HiC interactions and choosing to run enrichment analysis using the gene ids assigned to these regions (i.e. classic hypergeometric tests), as opposed to using GREAT [@McLean2010-gw] based on conventional associations between peaks and genes.
+
+Genes are assigned to genomic ranges with signal using `mapByFeature()` from the Bioconductor package `extraChIPs` in a hierarchical strategy using the parameters
+
+`r pander(map_by_feature_args)`
+
+These are interpreted as
+
+1. Ranges within `r map_by_feature_args$gr2prom/1e3`kb of a promoter are assigned to *all genes* within `r map_by_feature_args$prom2gene/1e3`kb of that promoter, where 0kb simply indicates direct overlap
+2. Ranges within `r map_by_feature_args$gr2enh/1e3`kb of an enhancer are mapped to *all genes* within `r map_by_feature_args$enh2gene/1e3`kb of the enhancer
+3. Ranges within `r map_by_feature_args$gr2gi/1e3`kb of a long-range interaction are mapped to *all genes* within `r map_by_feature_args$gi2gene/1e3`kb of either end of the interaction
+4. Ranges with no genes assigned in any of the above steps are then assigned to the *nearest gene* within `r  map_by_feature_args$gr2gene/1e3`kb
+
+In these steps, promoters are taken as all promoters defined above as part of the standard GRAVI workflow, as well as any able to be identified within the external files provided, using basic regex pattern matching.
+Similarly, enhancers will be identified if possible from these same files.
+Long-range Interactions will only be incorporated if provided.
+
+All values are able to modified using `params.yml`
+
+## Enrichment Analysis
+
+The same approach to enrichment analysis is defined to be used in all steps of the analysis, and can be performed using gene ids mapped to regions (`method = "gene_id"`) and one-sided hypergeometric tests, or by using the conventional approach of GREAT [@McLean2010-gw] as implemented in the package rGREAT [@Gu2023-rp] (`method = "great"`).
+The current approach, set via `params.yml`, is to use `r unname(c(great = "GREAT", gene_id = "gene IDs")[enrich_params$method])`.
+
+After testing and adjusting p-values (method = "`r enrich_params$adj`"), only gene-sets with $\geq$ `r enrich_params$min_sig` genes assigned to them will be returned in the results.
+For results tables, a significance value of $\alpha$ = `r enrich_params$alpha` will be applied to the adjused p-values.
+
+The [MSigDB](https://www.gsea-msigdb.org/gsea/msigdb/) database version `r packageVersion("msigdbr")` was used [@Liberzon2011-fr] as the primary source for gene sets.
+Gene-sets and pathways were include for enrichment testing if $\geq$ `r min(msigdb_params$size)` genes and $\leq$ `r max(msigdb_params$size)` genes were assigned to them.
+This left the following breakdown of gene-sets and pathways tested for enrichment during all steps.
+
+```{r tbl-msigdb}
+msigdb <- here::here(all_paths$annotation, "msigdb.rds") %>% read_rds()
+msigdb %>% 
+  distinct(gs_collection, gs_subcollection, gs_name) %>%
+  summarise(`Gene Sets` = dplyr::n(), .by = ends_with("collection")) %>% 
+  dplyr::rename(Category = gs_collection, `Sub-Category` = gs_subcollection) %>% 
+  mutate(
+    Description = case_when(
+      Category == "H" ~ "Hallmark Gene-Sets",
+      Category == "C1" ~ "Positional Gene Sets",
+      Category == "C2" ~ str_replace_all(`Sub-Category`, "CP:(.+)", "Curated Gene-Sets: \\1"),
+      str_detect(`Sub-Category`, "TFT") ~ str_replace_all(`Sub-Category`, "TFT:(.+)", "Transcription Factor Target Prediction Gene-Sets: \\1"),
+      str_detect(`Sub-Category`, "MIR") ~ str_replace_all(`Sub-Category`, "MIR:(.+)", "microRNA Target Gene-Sets: \\1"),
+      str_detect(`Sub-Category`, "CGN") ~ "Cancer Gene Neighbourhoods",
+      str_detect(`Sub-Category`, "CM") ~ "Cancer Modules",
+      str_detect(`Sub-Category`, "GO:BP") ~ "Gene Ontology: Biological Process",
+      str_detect(`Sub-Category`, "GO:MF") ~ "Gene Ontology: Molecular Function",
+      str_detect(`Sub-Category`, "GO:CC") ~ "Gene Ontology: Cellular Component",
+      str_detect(`Sub-Category`, "HPO") ~ "Human Phenotype Ontology",
+      Category == "C6" ~ "Oncogenic Signature Gene Sets",
+      `Sub-Category` == "IMMUNESIGDB" ~ "ImmuneSigDB Gene Sets",
+      `Sub-Category` == "VAX" ~ "Vaccine Response Gene Sets",
+      Category == "C8" ~ "Cell Type Signature Gene Sets"
+    ),
+    Category = factor(Category, levels = c("H", paste0("C", 1:8)))
+  ) %>% 
+  droplevels() %>% 
+  arrange(Category) %>% 
+  bind_rows(
+    tibble(Category = "Total", `Gene Sets` = sum(.[["Gene Sets"]]))
+  ) %>% 
+  pander(
+    justify = "llrl", 
+    caption = "*Summary of Gene-Sets used for Enrichment Testing*",
+    emphasize.strong.rows = which(grepl("Total", .$Category))
+  )
+```
+
+## Transcription Factor Motifs 
+
+```{r tf-db}
+tf_db <- read_rds(all_out$motif_list) %>% 
+  to_df() %>% 
+  as_tibble() %>% 
+  mutate(cluster = fct_infreq(cluster))
+top3 <- levels(tf_db$cluster)[1:3]
+if (!is.null(config$external$motifdb)) 
+  motif_params$data_source <- basename(config$external$motifdb)
+```
+
+Transcription factor binding motifs (TFBMs) were prepared from `r ifelse(is.null(config$external$motifdb), collapseGenes(motif_params$data_source), basename(config$external$motifdb))` with `r nrow(tf_db)` motifs prepared for downstream analysis.
+Whilst *all motifs will be retained for testing*, highly similar motifs were clustered to enable clearer reporting and interpretation.
+
+
+The largest motif clusters were:
+
+`r tf_db %>% dplyr::filter(cluster %in% top3) %>% droplevels() %>% split(.$cluster) %>% lapply(pull, "name") %>% pander()`
+
+```{r plot-tf-clusters, fig.height=6, fig.cap = glue("*Breakdown of the {max(as.integer(tf_db$cluster))} clusters formed amongst the {nrow(tf_db)} selected TFBMs*")}
+table(tf_db$cluster) %>% 
+  enframe(name = "cluster", value = "motifs") %>% 
+  mutate(motifs = as.factor(motifs)) %>% 
+  summarise(n = dplyr::n(), .by = motifs) %>% 
+  ggplot(aes(motifs, n)) + 
+  geom_col() +
+  geom_label(aes(y = n + 0.05 * max(n), label = comma(n))) +
+  labs(x = "Motifs in Cluster", y = "Number of Clusters") +
+  scale_y_continuous(expand = expansion(c(0, 0.05)))
+```
+
+### TFBM Cluster Visualisation {.tabset}
+
+As a check on the clustering strategy described above, the Information Content Matrices (ICM) for the largest three clusters are shown below.
+
+#### Cluster 1
+
+`r if (nrow(dplyr::filter(tf_db, cluster %in% top3[[1]])) >= 20) "The largest cluster was too big to visualise all motifs"`
+
+```{r tf-cl1, eval = nrow(dplyr::filter(tf_db, cluster %in% top3[[1]])) < 20, fig.cap = glue("*Information Content logos for all TFBMs within the largest cluster. Reverse complement sequences from the defined matrix are annotated with RC.*")}
+tf_db %>% 
+  dplyr::filter(cluster == top3[[1]]) %>% 
+  to_list() %>% 
+  view_motifs(names.pos = "right")
+```
+
+#### Cluster 2
+
+`r if (nrow(dplyr::filter(tf_db, cluster %in% top3[[2]])) >= 20) "The second largest cluster was too big to visualise all motifs"`
+
+```{r tf-cl2, eval = nrow(dplyr::filter(tf_db, cluster %in% top3[[2]])) < 20,  fig.cap = glue("*Information Content logos for all TFBMs within the second largest cluster. Reverse complement sequences from the defined matrix are annotated with RC.*")}
+tf_db %>% 
+  dplyr::filter(cluster == top3[[2]]) %>% 
+  to_list() %>% 
+  view_motifs(names.pos = "right")
+```
+
+#### Cluster 3
+
+`r if (nrow(dplyr::filter(tf_db, cluster %in% top3[[3]])) >= 20) "The third largest cluster was too big to visualise all motifs"`
+
+```{r tf-cl3, eval = nrow(dplyr::filter(tf_db, cluster %in% top3[[3]])) < 20, fig.cap = glue("*Information Content logos for all TFBMs within the third largest cluster. Reverse complement sequences from the defined matrix are annotated with RC.*")}
+tf_db %>% 
+  dplyr::filter(cluster == top3[[3]]) %>% 
+  to_list() %>% 
+  view_motifs(names.pos = "right")
+```
+
+
+## External Features
+
+```{r external-features}
+external_features <- here::here(all_paths$annotation, "features.rds") %>% 
+  read_rds()
+has_features <- length(external_features) > 0
+feat_col <- NULL
+```
+
+```{r feat-col, eval = has_features, echo = has_features}
+feat_col <- colours$features
+feat_levels <- c(
+  unique(unlist(external_features)$feature), "no_feature"
+)
+missing_feat_col <- setdiff(feat_levels, names(feat_col))
+if (length(missing_feat_col) > 0) {
+  if (!"no_feature" %in% feat_levels)
+    missing_feat_col <- c(missing_feat_col, "no_feature")
+  n <- length(missing_feat_col) 
+  feat_col[missing_feat_col] <- hcl.colors(max(9, n), "Spectral")[seq_len(n)]
+}
+colours$features <- feat_col[feat_levels]
+```
+
+
+`r ifelse(!has_features, "No external features were supplied.", glue("The external features provided as ", glue_collapse(names(external_features), sep = ", ", last = " & "), " were compared to the gene-centric annotations described above."))`
+
+```{r plot-feature-by-region, echo = has_features, fig.cap = glue("*The relationship between ranges provided as external features in ", glue_collapse(names(external_features), sep = ", ", last = " & "), " and the gene-centric regions defined above. Values were estimated using the proportion of bases within each feature that overlap each of the regions and are shown in Mb.*")}
+if (has_features) {
+  external_features %>% 
+    lapply(as_tibble) %>% 
+    lapply(dplyr::select, range, feature, all_of(names(gene_regions))) %>% 
+    lapply(
+      pivot_longer,
+      cols = all_of(names(gene_regions)), names_to = "region", values_to = "p"
+    ) %>% 
+    lapply(dplyr::filter, p > 0) %>% 
+    lapply(
+      mutate, 
+      region = factor(regions[region], levels = unname(regions)), 
+      width = p * width(GRanges(range)) / 1e6
+    ) %>% 
+    bind_rows(.id = "source") %>% 
+    summarise(
+      n = dplyr::n(), width = sum(width), .by = c(source, region, feature)
+    ) %>% 
+    mutate(feat_width = sum(width), .by = feature) %>% 
+    arrange(feat_width) %>% 
+    mutate(feature = fct_inorder(feature)) %>% 
+    ggplot(aes(width, feature, fill = region)) +
+    geom_col() +
+    facet_grid(rows =  vars(source), scales = "free", space = "free") +
+    scale_fill_manual(values = region_cols) +
+    scale_x_continuous(expand = expansion(c(0, 0.05))) +
+    labs(x = "Width (Mb)", y = "Feature", fill = "Region")
+}
+```
+
+
+```{r tab-features, eval = has_features, echo = has_features}
+cp <- em(
+  glue(
+      "Summary of external features provided in ", 
+      glue_collapse(
+        basename(unlist(config$external$features)), sep = ", ", last = " & "
+      ),
+      " All peaks and windows will be ", 
+      "compared to these throughout the workflow. The colours defined for each ",
+      "feature is show as a guide on the left."
+    )
+)
+tbl <-  external_features %>%
+  lapply(mutate, w = width) %>% 
+  lapply(as_tibble) %>% 
+  bind_rows(.id = "source") %>% 
+  dplyr::rename(width = w) %>% 
+  summarise(
+    N = dplyr::n(),
+    Width = sum(width/1e3),
+    med = median(width/1e3),
+    range = glue("[{round(min(width/1e3), 1)}, {round(max(width/1e3), 1)}]"),
+    .by = c(source, feature)
+  ) %>% 
+  mutate(
+    guide = unlist(feat_col)[feature],
+    feature = factor(feature, levels = names(feat_col)) 
+  ) %>%
+  arrange(feature) %>%
+  dplyr::select(guide, everything()) %>% 
+  reactable(
+    filterable = FALSE, searchable = TRUE, showPageSizeOptions = TRUE,
+    columns = list(
+      guide = colDef(
+        maxWidth = 40,
+        style = function(value) list(background = value),
+        cell = function(value) "",
+        name = ""
+      ),
+      source = colDef("Source"),
+      feature = colDef(
+        name = "Feature",
+        footer = htmltools::tags$b("Total")
+      ),
+      N = colDef(
+        cell = function(value) comma(value, 1),
+        footer = htmltools::tags$b(comma(sum(.$N)))
+      ),
+      Width = colDef(
+        name = "Total Width (kb)",
+        cell = function(value) comma(value, 1),
+        footer = htmltools::tags$b(comma(sum(.$Width), 1))
+      ),
+      med = colDef(
+        name = "Median Width (kb)",
+        cell = function(value) sprintf("%.2f", value)
+      ),
+      range = colDef(name = "Size Range (kb)", align = "right")
+    )
+  )
+div(class = "table",
+  div(class = "table-header",
+      div(class = "caption", cp),
+      tbl
+  )
+)
+```
+
+
+```{r add-rna, eval = has_rna, child = here::here('workflow/modules/_rna_description.Rmd')}
+```
+
+
+## HiC Data {.tabset}
+
+```{r has-hic, echo = FALSE}
+hic <- read_rds(all_out$hic)
+has_hic <- length(hic) > 0
+```
+
+`r ifelse(has_hic, glue("HiC data with {comma(length(hic), 1)} interaction pairs was provided and loaded."), "No HiC Data was supplied as an input.")`
+
+`r if (has_hic) "## Genomic Distribution of Interaction Pairs"`
+
+```{r plot-hic, eval = has_hic, echo = has_hic, fig.cap = "*Distribution of interaction pairs using pre-defined genomic regions.*"}
+hic %>% 
+  anchors() %>% 
+  vapply(
+    bestOverlap,
+    y = GRangesList(lapply(gene_regions, granges)),
+    character(length(hic))
+  ) %>% 
+  as_tibble() %>%
+  as.matrix() %>% 
+  apply(1, \(x) paste(sort(x), collapse = ":")) %>% 
+  as.character() %>% 
+  as_tibble_col("pair") %>% 
+  summarise(n = dplyr::n(), .by = pair) %>% 
+  separate(pair, c("anchor1", "anchor2"), sep = ":", remove = FALSE) %>% 
+  mutate(
+    across(
+      starts_with("anchor"), \(x) factor(regions[x], levels = unname(regions))
+      )
+  ) %>% 
+  bind_rows(
+    dplyr::filter(., anchor1 != anchor2) %>% setNames(c("pair", "anchor2", "anchor1", "n"))
+  ) %>% 
+  arrange(anchor1, anchor2) %>% 
+  distinct(pair, .keep_all = TRUE) %>% 
+  ggplot(aes(anchor1, fct_rev(anchor2), fill = n / sum(n))) +
+  geom_raster() +
+  geom_label(aes(label = percent(n / sum(n), 0.1)), fill = "white", alpha = 0.7) +
+  scale_fill_viridis_c(name = "Percent", labels = scales::percent, option = "B") +
+  scale_x_discrete(expand = rep_len(0, 4), labels = label_wrap(12)) +
+  scale_y_discrete(expand = rep_len(0, 4), labels = label_wrap(12)) +
+  theme(
+    panel.grid = element_blank(),
+    axis.title = element_blank(),
+    panel.border = element_blank(),
+    legend.position = "inside", legend.position.inside = c(0.85, 0.85)
+  )
+```
+
+
+## Colour Schemes {.tabset}
+
+```{r set_colours}
+## qc_colours need to have `Pass` and `Fail`
+missing_qc_cols <- setdiff(c("pass", "fail"), names(colours$qc))
+if ("pass" %in% missing_qc_cols) colours$qc$pass <- "#03A772" # Blue
+if ("fail" %in% missing_qc_cols) colours$qc$fail <- "#C10724" # Red
+colours$qc <- colours$qc[c("pass", "fail")]
+
+## The colours specified as treat_colours should contain all treat_levels + Input
+## If Input is missing, set to #33333380 ('grey20' + alpha = 50)
+## This should be a standard chunk for all workflows
+missing_treat_cols <- setdiff(
+  c("Input", treat_levels), names(colours$treat)
+)
+## Sample along the defaults for missing treat_colours
+if (length(missing_treat_cols) <= length(colours$treat$default)) {
+  colours$treat <- c(
+    colours$treat,
+    colours$treat$default[seq_along(missing_treat_cols)] %>% 
+      setNames(missing_treat_cols) %>% 
+      as.list()
+  )
+} else {
+  colours$treat <- c(
+    colours$treat,
+    ## Otherwise sample from viridis
+    hcl.colors(length(missing_treat_cols)) %>% 
+      setNames(missing_treat_cols) %>% 
+      as.list()
+  )
+}
+colours$treat <- colours$treat[names(colours$treat) != "default"]
+
+## Direction colours always need up, down, unchanged & undetected
+missing_dir_cols <- setdiff(
+  c("increased", "decreased", "unchanged", "undetected", "ambiguous"), 
+  names(colours$direction)
+)
+if (length(missing_dir_cols) > 0) {
+  def_dir_cols <- c(
+    increased = "#CA0020", decreased = "#0571B0", 
+    unchanged = "#7F7F7F", undetected = "#D5D5D5",
+    ambiguous = "#201040"
+  )
+  colours$direction[missing_dir_cols] <- def_dir_cols[missing_dir_cols]
+}
+
+# Pairwise colours
+default_pw <- expand.grid(
+  c("decreased", "increased", "unchanged"), 
+  c("decreased", "increased", "unchanged")
+) %>% 
+  mutate(across(starts_with("Var"), as.character)) %>% 
+  arrange(Var1, Var2) %>% 
+  unite("pair", starts_with("Var")) %>% 
+  mutate(
+    rgb = RColorBrewer::brewer.pal(9, "Paired") %>% setNames(pair)
+  ) %>% 
+  pull("rgb")
+missing_pw_cols <- setdiff(names(colours$pairwise), names(default_pw))
+if (length(missing_pw_cols)) {
+  colours$pairwise[missing_pw_cols] <- as.list(default_pw)[missing_pw_cols]
+}
+
+heat_cols <- targets %>% 
+  as.character() %>% 
+  lapply(\(x) all_heat_params[[x]]$gradient) %>% 
+  setNames(as.character(targets))
+
+target_cols <- map_chr(heat_cols, \(x) x[length(x)])
+if (any(duplicated(target_cols))) {
+  target_cols <- target_cols[!duplicated(target_cols)]
+  missing_tgt_cols <- setdiff(targets, names(target_cols))
+  n <- min(length(missing_tgt_cols), 9)
+  pal <- RColorBrewer::brewer.pal(9, "Set1")[seq_len(n)]
+  new_cols <- colorRampPalette(pal)(length(missing_tgt_cols))
+  names(new_cols) <- missing_tgt_cols
+  target_cols <- c(target_cols, new_cols)
+}
+colours$target <- target_cols
+```
+
+
+Colours were checked where provided and any missing colours were automatically assigned.
+These colour schemes are shown below and will be propagated through all steps of the workflow.
+To change any colours, simply add them to `config/rmarkdown.yml`.
+However it should be noted that many of the default schemes have been checked for [colour-blind friendliness](https://davidmathlogic.com/colorblind).
+
+```{r set-dev-to-png, echo=FALSE}
+knitr::opts_chunk$set(dev = "png")
+```
+
+
+### QC
+
+```{r plot-qc, fig.height=3, fig.width=2 + length(colours$qc)}
+.plotScheme(colours$qc , xlab = "QC Category") 
+```
+
+### Regions
+
+```{r plot-regions, fig.height=3, fig.width=2 + length(colours$regions)}
+.plotScheme(colours$regions, xlab = "Regions")
+```
+
+
+`r if(has_features) "### Features"`
+
+```{r plot-feat, eval = has_features, echo = has_features, fig.height = ifelse(length(feat_col) > 8, fh, 3), fig.width= ifelse(length(feat_col) > 8, fw, 2 + length(feat_col))}
+if (length(feat_col) <= 8) {
+  .plotScheme(feat_col, xlab = "Feature")
+} else {
+  colours$features %>% 
+    as_tibble() %>% 
+    pivot_longer(
+      cols = everything(), names_to = "feature", values_to = "colour"
+    ) %>% 
+    arrange(desc(str_to_lower(feature)) ) %>% 
+    mutate(
+      x = rep_len(5:1, nrow(.)) ,
+      d = c(1, diff(x)),
+      y = 1 + cumsum(d > 0)
+    ) %>% 
+    ggplot(aes(x, y, fill = I(colour))) +
+    geom_raster() +
+    geom_label(aes(label = feature), fill = rgb(1, 1, 1, 0.8), size = 4) +
+    scale_x_continuous(expand = rep_len(0, 4)) +
+    scale_y_continuous(expand = rep_len(0, 4)) +
+    theme(
+      text = element_blank(),
+      axis.ticks = element_blank(),
+      panel.grid = element_blank()
+    )
+}
+```
+
+### Treatment Groups
+
+```{r plot-treat, fig.height=3, fig.width=2 + length(colours$treat)}
+.plotScheme(colours$treat, xlab = "Treatment")
+```
+
+`r if (length(dsa_params)) "### Direction"`
+
+```{r plot-dir, fig.height=3, fig.width = 2 + length(colours$direction), eval = length(dsa_params) > 0, echo = length(dsa_params) > 0}
+.plotScheme(colours$direction, xlab = "Direction")
+```
+
+`r if (length(pw_params)) "### Pairwise"`
+
+```{r plot-pairwise, eval = length(pw_params) > 0, echo = length(pw_params) > 0}
+colours$pairwise %>% 
+  as_tibble() %>% 
+  pivot_longer(everything(), values_to = "colour") %>% 
+  separate(name, c("x", "y")) %>% 
+  mutate(across(all_of(c("x", "y")), str_to_title)) %>% 
+  mutate(
+    across(
+      all_of(c("x", "y")), 
+      \(x) factor(x, levels = c("Increased", "Unchanged", "Decreased"))
+      )
+  ) %>% 
+  ggplot(aes(x, y, fill = I(colour))) +
+  geom_tile() +
+  scale_x_discrete(expand = rep_len(0, 4)) +
+  scale_y_discrete(expand = rep_len(0, 4)) +
+  labs(x = "X Variable", y = "Y Variable")
+```
+
+
+`r if (length(dsa_params)) "### Heatmap Gradient"`
+
+```{r plot-gradient, fig.height = 5, fig.width = 8, eval = length(dsa_params) > 0, echo = length(dsa_params) > 0}
+heat_cols %>% 
+  lapply(\(x) colorRampPalette(x)(11)) %>% 
+  as_tibble() %>% 
+  mutate(
+    x = seq(0, 1, by = 0.1) %>% percent() %>% fct_inorder()
+  ) %>% 
+  pivot_longer(
+    cols = all_of(targets), names_to = "target", values_to = "colour"
+  ) %>% 
+  ggplot(aes(x, target, fill = I(colour))) +
+  geom_tile() +
+  scale_x_discrete(expand = rep_len(0, 4), name = "% Of Maximal Signal") +
+  scale_y_discrete(expand = rep_len(0, 4), name = "Target") +
+  theme_minimal() 
+```
+
+
+## Data Export
+
+```{r export}
+write_rds(colours, all_out$colours, compress = "gz")
+```
+
+
+During setup of all required annotations, the following files were exported:
+
+`r pander(lapply(all_out, str_extract, paste0(basename(here::here()), ".+")))`
+
+
+<button type="button" class="btn btn-default btn-sessioninfo" data-toggle="collapse" data-target="#sessioninfo" style="display: block;">
+<span class="glyphicon glyphicon-info-sign" aria-hidden="true"></span> Session information
+</button>
+</p>
+<div id="sessioninfo" class="collapse">
+```{r session-info, echo=FALSE}
+pander::pander(sessionInfo())
+```
+</div>

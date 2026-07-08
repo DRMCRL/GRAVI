@@ -1,0 +1,2967 @@
+```{r set-knitr-opts, echo=FALSE, child = here::here('analysis/setup_chunk.Rmd')}
+```
+
+
+```{r dummy-params, eval = FALSE, echo = FALSE}
+params <- list(
+ tgt1 = "ER",
+ tgt2 = "GATA3",
+ comp1 = "E2_E2DHT",
+ comp2 = "Veh_DHT",
+ full_comp = "ER_E2_E2DHT-GATA3_Veh_DHT",
+ results = "output/pairwise_comparisons/ER_E2_E2DHT-GATA3_Veh_DHT/ER_E2_E2DHT-GATA3_Veh_DHT-pairwise-results.rds",
+ dsa1 = "output/differential_signal/ER/ER_E2_E2DHT-differential-signal.rds",
+ dsa2 = "output/differential_signal/GATA3/GATA3_Veh_DHT-differential-signal.rds",
+ localz = "output/pairwise_comparisons/ER_E2_E2DHT-GATA3_Veh_DHT/ER_E2_E2DHT-GATA3_Veh_DHT-pairwise_localz.rds",
+ motif_enrichment = "output/pairwise_comparisons/ER_E2_E2DHT-GATA3_Veh_DHT/ER_E2_E2DHT-GATA3_Veh_DHT-motif_enrichment.tsv.gz",
+ motif_position = "output/pairwise_comparisons/ER_E2_E2DHT-GATA3_Veh_DHT/ER_E2_E2DHT-GATA3_Veh_DHT-motif_position.tsv.gz"
+)
+```
+
+
+
+```{r packages}
+library(tidyverse)
+library(glue)
+library(pander)
+library(yaml)
+library(extraChIPs)
+library(scales)
+library(ggrepel)
+library(reactable)
+library(htmltools)
+library(rlang)
+library(plyranges)
+library(parallel)
+library(rtracklayer)
+library(patchwork)
+library(magrittr)
+library(rlang)
+library(ggside)
+library(ggraph)
+library(tidygraph)
+library(universalmotif)
+library(motifTestR)
+library(GenomicInteractions)
+source(here::here("scripts", "custom_functions.R"))
+source(here::here("scripts", "enrichment_funs.R"))
+threads <- detectCores() - 1
+if (interactive()) threads <- 4
+config <- read_yaml(here::here("config", "config.yml"))
+ucsc <- get_ucsc(config$genome$build)
+bs_pkg <- glue("BSgenome.{ucsc$sp}.UCSC.{ucsc$build}")
+library(bs_pkg, character.only = TRUE)
+bs_genome <- get(bs_pkg)
+panderOptions("big.mark", ",")
+panderOptions("missing", "")
+panderOptions("table.split.table", Inf)
+theme_set(
+  theme_bw() +
+    theme(
+      text = element_text(size = 10), # TODO: Set in params
+      plot.title = element_text(hjust = 0.5)
+    )
+)
+```
+
+
+
+```{r get_params, echo = FALSE}
+targets <- params[c("tgt1", "tgt2")] %>% unlist()
+n_targets = length(unique(targets))
+treat_levels <- params[paste0("comp", 1:2)] %>% 
+  lapply(\(x) strsplit(x, split = "_")[[1]])
+comp_names <- list(
+  comp1 = glue("{params$tgt1}_{params$comp1}"),
+  comp2 = glue("{params$tgt2}_{params$comp2}")
+)
+comp_labels <- list(
+  comp1 = glue("{params$tgt1}: {treat_levels$comp1[[2]]} Vs {treat_levels$comp1[[1]]}"),
+  comp2 = glue("{params$tgt2}: {treat_levels$comp2[[2]]} Vs {treat_levels$comp2[[1]]}")
+)
+if (n_targets > 1) {
+  short_names <- as.list(targets)
+} else {
+  short_names <- treat_levels %>% 
+    lapply(\(x) paste(x[[2]], "Vs", x[[1]]))
+}
+names(short_names) <- paste0("comp", 1:2)
+all_paths <- here::here("config", "json", "all_paths.json") %>% 
+  jsonlite::fromJSON() %>%
+  lapply(here::here)
+diff_sig_param <- here::here(
+  "config", "json", "differential_signal_param.json"
+) %>% 
+  jsonlite::fromJSON() %>% 
+  .[targets]
+enrich_params <- here::here("config", "params.yml") %>%
+  read_yaml() %>%
+  pluck("enrichment")
+network_params <- here::here("config", "params.yml") %>%
+  read_yaml() %>%
+  pluck("networks")
+motif_params <- here::here("config", "json", "motif_analysis_param.json") %>% 
+  jsonlite::fromJSON() %>% 
+  pluck("pairwise")
+msigdb_params <- here::here("config", "params.yml") %>%
+  read_yaml() %>%
+  pluck("msigdb")
+pw_param <- here::here("config", "json", "pairwise_param.json") %>% 
+  jsonlite::fromJSON() %>% 
+  pluck(params$full_comp)
+region_params <- here::here("config", "params.yml") %>%
+  read_yaml() %>%
+  pluck("gene_regions")
+regioner_params <- here::here("config", "params.yml") %>%
+  read_yaml() %>%
+  pluck("regioner")
+heat_params <- here::here("config", "json", "profile_heatmap_param.json") %>% 
+  jsonlite::fromJSON() %>% 
+  .[targets]
+source(here::here("scripts", "table_funs.R"))
+```
+
+
+```{r load-annotations}
+## Regions & Features
+gene_regions <- here::here(all_paths$annotation, "gene_regions.rds") %>% 
+  read_rds()
+sq <- seqinfo(gene_regions)
+regions <- map_chr(gene_regions, \(x) unique(x$region))
+features <- here::here(all_paths$annotation, "features.rds") %>%
+  read_rds()
+has_features <- length(features) > 0
+feat_names <- names(features) %>% 
+  lapply(
+    \(x) paste(x, features[[x]]$feature, sep = ": ")
+  ) %>% 
+  lapply(fct_infreq) %>% 
+  lapply(levels) %>% 
+  unlist()
+all_regions <- c(unname(regions), feat_names)
+region_sources <- tibble(
+  source = "GRAVI", region = unname(regions)
+) %>% 
+  bind_rows(
+    lapply(features, \(x) tibble(region = unique(x$feature))) %>% 
+      bind_rows(.id = 'source')
+  )
+## Gene-level
+gtf <- here::here(all_paths$annotation, "gtf.rds") %>% read_rds()
+id2gene <- structure(gtf$gene$gene_name, names = gtf$gene$gene_id) %>% 
+  .[!duplicated(names(.))]
+prot_genes <- subset(gtf$gene, gene_type == "protein_coding")$gene_name
+rna <- here::here(all_paths$annotation, "rna.rds") %>% read_rds()
+## HiC
+hic <- here::here(all_paths$annotation, "hic.rds") %>% read_rds()
+has_hic <- length(hic) > 0
+```
+
+```{r colours}
+colours <- here::here(all_paths$annotation, "colours.rds") %>%
+  read_rds() %>% 
+  lapply(unlist)
+comp_cols <- colours$target[targets]
+## Pairwise palette
+pw_relabel <- function(x, c1 = short_names$comp1, c2 = short_names$comp2) {
+  x %>% 
+      str_replace_all("Increased.+Increased", "Both Increased") %>% 
+      str_replace_all("Decreased.+Decreased", "Both Decreased") %>% 
+      str_replace_all("Unchanged.+Unchanged", "Both Unchanged") %>% 
+      str_replace_all("(.+) - (.+)", paste(c1, "\\1 -", c2, "\\2")) 
+}
+pw_cols <- colours$pairwise
+names(pw_cols) <- names(pw_cols) %>% 
+  str_replace_all("^(.+)_(.+)$", "\\1 - \\2") %>% 
+  str_to_title() 
+pw_cols <- c(
+  pw_cols,
+  setNames(pw_cols, pw_relabel(names(pw_cols)))
+)
+region_colours <- colours$regions %>% 
+  setNames(regions[names(colours$regions)]) %>% 
+  .[unname(regions)]
+feature_colours <- unlist(colours$features)
+direction_colours <- colours$direction %>% 
+  setNames(str_to_title(names(.)))
+dir_levels <- names(direction_colours)
+treat_colours <- colours$treat[unique(unlist(treat_levels))]
+full_palette <- c(
+  feature_colours, region_colours, direction_colours, treat_colours,
+  colours$target[targets],
+  pw_cols,
+  c(
+    "None" = colours$direction[["undetected"]],
+    "Other" = colours$direction[["unchanged"]])
+)
+```
+
+```{r figure-params}
+fig_params <- here::here("config", "rmarkdown.yml") %>% 
+  read_yaml() %>% 
+  pluck("knitr_opts")
+fw <- fig_params$fig.width
+fh <- fig_params$fig.height
+fig_type <- fig_params$dev[[1]]
+if (is.null(fig_type)) stop("Couldn't detect figure type")
+fig_fun <- match.fun(fig_type)
+if (fig_type %in% c("bmp", "jpeg", "png", "tiff")) {
+  ## These figure types require dpi & resetting to be inches
+  formals(fig_fun)$units <- "in"
+  formals(fig_fun)$res <- 300
+}
+fig_path <- here::here("docs", "assets", params$full_comp)
+if (!dir.exists(fig_path)) dir.create(fig_path, recursive = TRUE)
+```
+
+
+```{r load-data}
+filtered_peaks <- list(
+  here::here(all_paths$peaks, params$tgt1, "{params$tgt1}_{treat_levels$comp1}"),
+  here::here(all_paths$peaks, params$tgt2, "{params$tgt2}_{treat_levels$comp2}")
+) %>% 
+  lapply(glue) %>% 
+  unlist() %>% 
+  paste0("_filtered_peaks.narrowPeak") %>% 
+  unique() %>% 
+  importPeaks(seqinfo = sq) %>% 
+  setNames(str_remove_all(names(.), "_filtered.+"))
+combined_results <- here::here(params$results) %>% read_rds()
+n_by_status <- combined_results %>% 
+  splitAsList(.$status) %>% 
+  endoapply(granges) %>% 
+  endoapply(unique) %>% 
+  map_int(length)
+dsa_results <- params[c("dsa1", "dsa2")] %>% 
+  lapply(here::here) %>%
+  lapply(read_rds) %>% 
+  setNames(short_names)
+```
+
+```{r reclass-df}
+reclass_by_region <- combined_results %>% 
+  select(region, ends_with("logFC"), ends_with("FDR")) %>% 
+  addDiffStatus(
+    fc_col = paste0(comp_names$comp1, "_logFC"),
+    sig_col = paste0(comp_names$comp1, "_FDR"),
+    alpha = diff_sig_param[[params$tgt1]]$alpha,
+    new_col = paste0(comp_names$comp1, "_orig_status")
+  ) %>% 
+  addDiffStatus(
+    fc_col = paste0(comp_names$comp2, "_logFC"),
+    sig_col = paste0(comp_names$comp2, "_FDR"),
+    alpha = diff_sig_param[[params$tgt2]]$alpha,
+    new_col = paste0(comp_names$comp2, "_orig_status")
+  ) %>% 
+  mcols() %>% 
+  as_tibble() %>% 
+  mutate(
+    status = fct_cross(
+      !!sym(paste0(comp_names$comp1, "_orig_status")),
+      !!sym(paste0(comp_names$comp2, "_orig_status")),
+      sep = " - "
+    )
+  ) %>% 
+  summarise(
+    orig_n = dplyr::n(), .by = c(region, status)
+  )
+if (length(features)) {
+  reclass_by_feature <- combined_results %>% 
+    select(feature, ends_with("logFC"), ends_with("FDR")) %>% 
+    addDiffStatus(
+      fc_col = paste0(comp_names$comp1, "_logFC"),
+      sig_col = paste0(comp_names$comp1, "_FDR"),
+      alpha = diff_sig_param[[params$tgt1]]$alpha,
+      new_col = paste0(comp_names$comp1, "_orig_status")
+    ) %>% 
+    addDiffStatus(
+      fc_col = paste0(comp_names$comp2, "_logFC"),
+      sig_col = paste0(comp_names$comp2, "_FDR"),
+      alpha = diff_sig_param[[params$tgt2]]$alpha,
+      new_col = paste0(comp_names$comp2, "_orig_status")
+    ) %>% 
+    mcols() %>% 
+    as_tibble() %>% 
+    unnest(feature, keep_empty = TRUE) %>% 
+    mutate(
+      feature = str_replace_na(feature, "no_feature"),
+      status = fct_cross(
+        !!sym(paste0(comp_names$comp1, "_orig_status")),
+        !!sym(paste0(comp_names$comp2, "_orig_status")),
+        sep = " - "
+      )
+    ) %>% 
+    summarise(
+      orig_n = dplyr::n(), .by = c(feature, status)
+    )
+}  
+```
+
+
+## Outline
+
+This stage of the GRAVI workflow presents the combined results from two individual differential signal analyses (DSA), integrating the results by finding regions which directly overlap and considering the joint behaviour.
+In this specific analyses the DSA results for `r comp_labels[[1]]`, will be integrated with the results from `r comp_labels[[2]]`.
+
+
+### Integration Of Differential Signal Results
+
+The initial steps of DSA detect regions with statistically supported changes in signal, however the integration of datasets instead focusses on the *most correct* classification of a given locus, where unchanged is not *simply lack of a statistically significant result*, but *a true state needing to be correctly identified*.
+Differential signal analyses generally focus on controlling the Type I errors (i.e. false positive), which comes with a commensurate increase in Type II errors (false negatives).
+Consequently, when seeking to correctly classify a locus across two datasets, any detection as changed can be taken as a robust finding, whilst the consideration as unchanged may be less robust.
+When comparing results from overlapping windows across two datasets, detection as changed within one dataset can be taken as primary evidence of 'something interesting' occurring, with the secondary consideration being the correct description of the *pairwise signal patterns*.
+
+For all loci where signal was detected in both comparisons, Wilkinson's maximum p-value was calculated [@wilkinson51] using both FDR-adjusted p-values.
+Where change was *already observed in one comparison*, these values were then used as the criteria to check logFC estimates in the second comparison. 
+If the estimated logFC was beyond the range around zero where no significance had been declared at other loci, these secondary sites were reclassified as either Increased or Decreased.
+The insistence on the more stringent initial inclusion criteria still protects against false discoveries from the perspective of window identification, but this approach instead allows *improved classification* across both comparisons, taking the complementary comparison into account.
+
+For *classification steps within each window*, each target is given the status 1) Increased, 2) Decreased, 3) Unchanged, or 4) Undetected.
+Across two comparisons, this gives 15 possible classifications for each region found with signal from at least one comparison (e.g. Increased-Increased, Increased-Decreased, Increased-Unchanged, Increased-Undetected etc.), given that any potential Undetected-Undetected windows will not be included for obvious reasons.
+
+## General Comparison
+
+Data was loaded for the initially-identified peaks to show the general level of similarity between signal regions from either dataset.
+
+### Summary Figures {.tabset}
+
+#### Treatment Specific Peaks
+
+```{r treatment-peaks-upset, fig.height = 6, fig.cap = glue("*Peaks detected for ", glue_collapse(unique(targets), sep = " and " ), " in the treatment groups ", glue_collapse(unique(unlist(treat_levels)), sep = ", ", last = " & "), ".*")}
+filtered_peaks %>% 
+  .[rev(names(.))] %>% 
+  setNames(str_replace_all(names(.), "(.+)_(.+)", "\\1 (\\2)")) %>% 
+  plotOverlaps(
+    type = "upset", .sort_sets = FALSE, n_intersections = 20,
+    set_col = treat_colours[str_replace_all(names(.), ".+\\((.+)\\)", "\\1")]
+  )
+```
+
+
+```{r compare-targets, eval = n_targets > 1, child = here::here('workflow/modules/_compare_targets.Rmd')}
+```
+
+## Combined Differential Signal Results
+
+`r metadata(combined_results)$description`
+
+### Results Tables {.tabset}
+
+#### Summary Table
+
+```{r tbl-summary, echo = FALSE}
+cp <- htmltools::tags$caption(
+  htmltools::tags$em(
+    glue(
+      "Summary of combined results for ",
+      glue_collapse(short_names, sep = " and "),
+      ". Ranges were classified as described above. ",
+      "Where signal was detected in both comparisons, the median distance ",
+      "between peak centres is given.",
+      "The number of loci showing each combined pattern are given summarised ",
+      "across all overlapping gene-centric regions, with these able to be ",
+      "included in filtering interactively, and expanded using the arrows in the ",
+      "leftmost column. The number of loci re-classified when combining results ",
+      "is also provided in the last column, with sites generally expected to be ",
+      "reclassified from an unchanged category to either 'increased' or 'decreased'."
+    )
+  )
+)
+tbl <- combined_results %>%
+  mutate(w = width) %>% 
+  as_tibble() %>%
+  summarise(
+    total = dplyr::n(),
+    width_kb = sum(w) / 1e3,
+    median_width = median(w),
+    d = median(d, na.rm = TRUE),
+    .by = c(status, region)
+  ) %>% 
+  arrange(desc(total)) %>% 
+  separate(status, into = unlist(short_names), sep = " - ", remove = FALSE) %>% 
+  mutate(
+    across(
+      all_of(unname(unlist(short_names))), 
+      \(x) factor(x, levels = names(direction_colours))
+    )
+  ) %>% 
+  droplevels() %>% 
+  arrange(!!!syms(unname(short_names)), region) %>% 
+  left_join(
+    reclass_by_region, by = c("region", "status")
+  ) %>% 
+  mutate(
+    orig_n = ifelse(is.na(orig_n), 0, orig_n),
+    reclass = total - orig_n
+  ) %>% 
+  dplyr::select(-orig_n) %>% 
+  reactable(
+    filterable = TRUE, showPageSizeOptions = nrow(.) > 10,
+    groupBy = "status",
+    columns = list2(
+      status = colDef(
+        "Click To<br>Expand", html = TRUE, maxWidth = 80,
+        grouped = JS("function(cellInfo, state) {
+            val = ''
+            return val
+          }"),
+        footer = htmltools::tags$b("Total")
+      ),
+      !!sym(short_names$comp1) := colDef(
+        aggregate = "unique",
+        cell = function(value) {
+          value <- str_extract(value, "Increased|Decreased|Unchanged|Undetected")
+          if (str_detect(value, "Increased")) value <- paste(value, "\u21E7")
+          if (str_detect(value, "Decreased")) value <- paste(value, "\u21E9")
+          paste(targets[[1]], value)
+        },
+        style = function(value) list(color = direction_colours[[value]]),
+        filterInput = function(values, name) {
+          tags$select(
+            # Set to undefined to clear the filter
+            onchange = sprintf(
+              "Reactable.setFilter('summary-result-table', '%s', event.target.value || undefined)",
+              name
+            ),
+            # "All" has an empty value to clear the filter, and is the default option
+            tags$option(value = "", "All"),
+            lapply(unique(values), tags$option),
+            "aria-label" = sprintf("Filter %s", name),
+            style = "width: 100%; height: 28px;"
+          )
+        }
+      ),
+      !!sym(short_names$comp2) := colDef(
+        aggregate = "unique",        
+        cell = function(value) {
+          value <- str_extract(value, "Increased|Decreased|Unchanged|Undetected")
+          if (str_detect(value, "Increased")) value <- paste(value, "\u21E7")
+          if (str_detect(value, "Decreased")) value <- paste(value, "\u21E9")
+          paste(targets[[2]], value)
+        },
+        style = function(value) list(color = direction_colours[[value]]),
+        filterInput = function(values, name) {
+          tags$select(
+            # Set to undefined to clear the filter
+            onchange = sprintf(
+              "Reactable.setFilter('summary-result-table', '%s', event.target.value || undefined)",
+              name
+            ),
+            # "All" has an empty value to clear the filter, and is the default option
+            tags$option(value = "", "All"),
+            lapply(unique(values), tags$option),
+            "aria-label" = sprintf("Filter %s", name),
+            style = "width: 100%; height: 28px;"
+          )
+        }
+      ),
+      region = colDef(
+        "Region",
+        filterInput = function(values, name) {
+          tags$select(
+            # Set to undefined to clear the filter
+            onchange = sprintf(
+              "Reactable.setFilter('summary-result-table', '%s', event.target.value || undefined)",
+              name
+            ),
+            # "All" has an empty value to clear the filter, and is the default option
+            tags$option(value = "", "All"),
+            lapply(unique(values), tags$option),
+            "aria-label" = sprintf("Filter %s", name),
+            style = "width: 100%; height: 28px;"
+          )
+        }
+      ),
+      total = colDef(
+        name = "Number of Ranges", format = comma_col, aggregate = "sum",
+        filterMethod = js_greater, maxWidth = 150,
+        footer = JS("function(column, state) {
+            let total = 0
+            state.sortedData.forEach(function(row) {
+              total += row[column.id]
+            })
+            return total.toLocaleString('en-US')
+          }")
+      ),
+      width_kb = colDef(
+        "Total Width (kb)", format = colFormat(separators = TRUE, digits = 1),
+        filterMethod = js_greater,
+        maxWidth = 120, aggregate = "median",
+        footer = JS("function(column, state) {
+            let total = 0
+            let n = 0
+            state.sortedData.forEach(function(row) {
+              let value = parseFloat(row[column.id]);
+              if (!isNaN(value)) {
+                total += value;
+                n += 1;
+              }
+            })
+            mn = total / n
+            return mn.toFixed(1)
+          }")
+      ),
+      median_width = colDef(
+        "Median Width (bp)", format = colFormat(separators = TRUE, digits = 0),
+        filterMethod = js_greater,
+        maxWidth = 120, aggregate = "median"
+      ),
+      d = colDef(
+        "Median Distance", format = comma_col, filterMethod = js_greater,
+        maxWidth = 120, aggregate = "median",
+        aggregated = JS("function(cellInfo, state) {
+           let total = 0;
+           let n = 0;
+           state.sortedData.forEach(function(row) {
+               total += parseFloat(cellInfo.value);
+               n += 1;
+           })
+           if (!isNaN(total)){
+             return total / n;
+           } else {
+             return '';
+           }
+          }
+          "),
+        footer = JS("function(column, state) {
+            let total = 0
+            let n = 0
+            state.sortedData.forEach(function(row) {
+              let value = parseFloat(row[column.id]);
+              if (!isNaN(value)) {
+                total += value;
+                n += 1;
+              }
+            })
+            mn = total / n
+            return mn.toFixed(1)
+          }")
+      ),
+      reclass = colDef(
+        "Re-Classified", aggregate = "sum", filterMethod = js_greater
+      )
+    ),
+    defaultColDef = colDef(footerStyle = list(fontWeight = "bold")),
+    elementId = 'summary-result-table'
+  )
+tl <- tagList(
+  cp,
+  tags$button(
+    tagList(fontawesome::fa("download"), "Download as CSV"),
+    onclick = sprintf(
+      "Reactable.downloadDataCSV('summary-result-table', '%s_summary.csv')",
+      params$full_comp
+    )
+  ),
+  tags$button(
+    "Expand/Collapse All",
+    onclick = "Reactable.toggleAllRowsExpanded('summary-result-table')"
+  ),
+  tags$button(
+    "Clear All Filters",
+    onclick = "Reactable.setAllFilters('summary-result-table', [])"
+  ),
+  tbl
+)
+htmltools::browsable(tl)
+```
+
+`r if (has_features) "#### Summary Table By Feature"`
+
+```{r tbl-summary-by-feature, echo = FALSE}
+if (has_features) {
+  id <- 'summary-table-by-feature'
+  cp <- htmltools::tags$caption(
+    htmltools::tags$em(
+      glue(
+        "Summary of combined results for ",
+        glue_collapse(short_names, sep = " and "),
+        "grouping results by feature. Ranges were classified as described above. ",
+        "Where signal was detected in both comparisons, the median distance ",
+        "between peak centres is given.",
+        "The number of loci showing each combined pattern are given summarised ",
+        "across all overlapping gene-centric regions, with these able to be ",
+        "included in filtering interactively, and expanded using the arrows in the ",
+        "leftmost column. The number of loci re-classified when combining results ",
+        "is also provided in the last column, with sites generally expected to be ",
+        "reclassified from an unchanged category to either 'increased' or 'decreased'.",
+        "Given that loci may map to multiple features and contribute to ", 
+        "multiple summary values, totals are not provided."
+      )
+    )
+  )
+  tbl <- combined_results %>%
+    mutate(w = width) %>% 
+    as_tibble() %>%
+    unnest(feature, keep_empty = TRUE) %>% 
+    mutate(feature = str_replace_na(feature, "no_feature")) %>% 
+    summarise(
+      total = dplyr::n(),
+      width_kb = sum(w) / 1e3,
+      median_width = median(w),
+      d = median(d, na.rm = TRUE),
+      .by = c(status, feature)
+    ) %>% 
+    arrange(desc(total)) %>% 
+    separate(status, into = unlist(short_names), sep = " - ", remove = FALSE) %>% 
+    mutate(
+      across(
+        all_of(unname(unlist(short_names))), 
+        \(x) factor(x, levels = names(direction_colours))
+      )
+    ) %>% 
+    droplevels() %>% 
+    arrange(!!!syms(unname(short_names)), feature) %>% 
+    left_join(
+      reclass_by_feature, by = c("feature", "status")
+    ) %>% 
+    mutate(
+      orig_n = ifelse(is.na(orig_n), 0, orig_n),
+      reclass = total - orig_n
+    ) %>% 
+    dplyr::select(
+      feature, all_of(unname(unlist(short_names))), total, contains("width"), 
+      d, reclass
+    ) %>% 
+    reactable(
+      groupBy = "feature", showPageSizeOptions = nrow(.) > 10,
+      filterable = TRUE,
+      columns = list2(
+        feature = colDef(
+          "Feature",
+          filterInput = function(values, name) {
+            tags$select(
+              # Set to undefined to clear the filter
+              onchange = sprintf(
+                "Reactable.setFilter('%s', '%s', event.target.value || undefined)",
+                id, name
+              ),
+              # "All" has an empty value to clear the filter, and is the default option
+              tags$option(value = "", "All"),
+              lapply(unique(values), tags$option),
+              "aria-label" = sprintf("Filter %s", name),
+              style = "width: 100%; height: 28px;"
+            )
+          }
+        ),
+        !!sym(short_names$comp1) := colDef(
+          aggregate = "unique",
+          cell = function(value) {
+            value <- str_extract(value, "Increased|Decreased|Unchanged|Undetected")
+            if (str_detect(value, "Increased")) value <- paste(value, "\u21E7")
+            if (str_detect(value, "Decreased")) value <- paste(value, "\u21E9")
+            paste(targets[[1]], value)
+          },
+          style = function(value) list(color = direction_colours[[value]]),
+          filterInput = function(values, name) {
+            tags$select(
+              # Set to undefined to clear the filter
+              onchange = sprintf(
+                "Reactable.setFilter('%s', '%s', event.target.value || undefined)",
+                id, name
+              ),
+              # "All" has an empty value to clear the filter, and is the default option
+              tags$option(value = "", "All"),
+              lapply(unique(values), tags$option),
+              "aria-label" = sprintf("Filter %s", name),
+              style = "width: 100%; height: 28px;"
+            )
+          }
+        ),
+        !!sym(short_names$comp2) := colDef(
+          aggregate = "unique",        
+          cell = function(value) {
+            value <- str_extract(value, "Increased|Decreased|Unchanged|Undetected")
+            if (str_detect(value, "Increased")) value <- paste(value, "\u21E7")
+            if (str_detect(value, "Decreased")) value <- paste(value, "\u21E9")
+            paste(targets[[2]], value)
+          },
+          style = function(value) list(color = direction_colours[[value]]),
+          filterInput = function(values, name) {
+            tags$select(
+              # Set to undefined to clear the filter
+              onchange = sprintf(
+                "Reactable.setFilter('%s', '%s', event.target.value || undefined)",
+                id, name
+              ),
+              # "All" has an empty value to clear the filter, and is the default option
+              tags$option(value = "", "All"),
+              lapply(unique(values), tags$option),
+              "aria-label" = sprintf("Filter %s", name),
+              style = "width: 100%; height: 28px;"
+            )
+          }
+        ),
+        total = colDef(
+          name = "Number of Ranges", format = comma_col, aggregate = "sum",
+          filterMethod = js_greater, maxWidth = 150
+        ),
+        width_kb = colDef(
+        "Total Width (kb)", format = colFormat(separators = TRUE, digits = 1),
+        filterMethod = js_greater,
+        maxWidth = 120, aggregate = "median",
+        footer = JS("function(column, state) {
+            let total = 0
+            let n = 0
+            state.sortedData.forEach(function(row) {
+              let value = parseFloat(row[column.id]);
+              if (!isNaN(value)) {
+                total += value;
+                n += 1;
+              }
+            })
+            mn = total / n
+            return mn.toFixed(1)
+          }")
+      ),
+      median_width = colDef(
+        "Median Width (bp)", format = colFormat(separators = TRUE, digits = 0),
+        filterMethod = js_greater,
+        maxWidth = 120, aggregate = "median"
+      ),
+        d = colDef(
+          "Mean Distance", format = comma_col, filterMethod = js_greater,
+          maxWidth = 120, aggregate = "median",
+          aggregated = JS("function(cellInfo, state) {
+           let total = 0;
+           let n = 0;
+           state.sortedData.forEach(function(row) {
+               total += parseFloat(cellInfo.value);
+               n += 1;
+           })
+           if (!isNaN(total)){
+             return total / n;
+           } else {
+             return '';
+           }
+          }
+          ")
+        ),
+        reclass = colDef(
+          "Re-Classified", aggregate = "sum", filterMethod = js_greater
+        )
+      ),
+      elementId = id
+    )
+  tl <- tagList(
+    cp,
+    tags$button(
+      tagList(fontawesome::fa("download"), "Download as CSV"),
+      onclick = sprintf(
+        "Reactable.downloadDataCSV('%s', '%s_summary_by_feature.csv')",
+        id, params$full_comp
+      )
+    ),
+    tags$button(
+      "Expand/Collapse All",
+      onclick = sprintf("Reactable.toggleAllRowsExpanded('%s')", id)
+    ),
+    tags$button(
+      "Clear All Filters",
+      onclick = sprintf("Reactable.setAllFilters('%s', [])", id)
+    ),
+    tbl
+  )
+  htmltools::browsable(tl)
+}
+```
+
+### Summary Figures {.tabset}
+
+#### Overall Status
+
+```{r plot-both-donut, fig.cap = "*Summary of signal across both comparisons incorporating all sites where signal was detected in either comparison. Ranges where signal is changed in either comparisons are exploded.*"}
+combined_results %>% 
+  subset(!grepl("Undetected", status)) %>% 
+  as_tibble() %>% 
+  dplyr::select(ends_with("_status")) %>% 
+  setNames(unlist(short_names)) %>% 
+  plotSplitDonut(
+    inner = !!sym(short_names$comp1), outer = !!sym(short_names$comp2), 
+    inner_palette = direction_colours, outer_palette = direction_colours,
+    inner_glue = "{inner}\n{.data[[inner]]}\n{comma(n, 1)}\n({percent(p, 0.1)})",
+    inner_label_alpha = 0, inner_label_colour = "white",
+    outer_glue = "{outer} {.data[[outer]]}\n{comma(n, 1)} ({percent(p, 0.1)})",
+    outer_min_p = 0.02, outer_label = "text", outer_rotate = TRUE,
+    outer_label_colour = "palette",
+    explode_inner = "(In|De)creased", explode_outer = "(In|De)creased",
+    explode_r = 0.4, explode_query = "AND", nudge_r = 0.5
+  ) %>% 
+    .[[1]]
+```
+
+
+#### Pairwise Differential Signal
+
+
+```{r plot-dbwin, fig.cap = glue("*Comparative changes in both ", glue_collapse(comp_labels, sep = " and "), ". The range with most extreme combined change in signal is shown with any protein-coding genes labelled. The range around zero used for range-based hypothesis testing is indicated with grey dashed lines.*")}
+df <- combined_results %>% 
+  as_tibble() %>% 
+  select(
+    range,
+    ends_with("logFC"), ends_with("status"), any_of(c("region", "feature")), 
+    starts_with("gene")
+  ) %>% 
+  dplyr::rename(
+    "{short_names$comp1} logFC" := !!sym(
+      paste(params$tgt1, params$comp1, "logFC", sep = "_")
+    ),
+    "{short_names$comp2} logFC" := !!sym(
+      paste(params$tgt2, params$comp2, "logFC", sep = "_")
+    ),
+    "{short_names$comp1} status" := !!sym(
+      paste(params$tgt1, params$comp1, "status", sep = "_")
+    ),
+    "{short_names$comp2} status" := !!sym(
+      paste(params$tgt2, params$comp2, "status", sep = "_")
+    ),
+  )
+x_lim <- range(df[[glue("{short_names$comp1} logFC")]], na.rm = TRUE)
+y_lim <- range(df[[glue("{short_names$comp2} logFC")]], na.rm = TRUE)
+df %>% 
+  arrange(status) %>% 
+  ggplot(
+    aes(
+      x = !!sym(glue("{short_names$comp1} logFC")), 
+      y = !!sym(glue("{short_names$comp2} logFC")),
+      colour = status
+    )
+  ) +
+  geom_point(
+    data = . %>% dplyr::filter(!str_detect(status, "Undetected"))
+  ) +
+  geom_label_repel(
+    aes(label = label),
+    data = . %>% 
+      mutate(
+        across(ends_with("logFC"), list(sq = \(x) x^2)),
+        diam = (
+          !!sym(glue("{short_names$comp1} logFC_sq")) + 
+            !!sym(glue("{short_names$comp2} logFC_sq"))
+        )
+      ) %>% 
+      dplyr::filter(diam > 1) %>% 
+      arrange(desc(diam)) %>% 
+      dplyr::slice(1:10, .by = status) %>% 
+      mutate(
+        label = map_chr(
+          gene_name, 
+          \(x) paste(intersect(x, prot_genes), collapse = "; ")
+        ) %>% 
+          str_wrap(15) %>% 
+          str_trunc(30) 
+      ) %>% 
+      dplyr::filter(label != "", !grepl("Unchanged.+Unchanged", status)) %>% 
+      dplyr::slice(1:2, .by = status),
+    size = 3, show.legend = FALSE, fill = rgb(1, 1, 1, 0.8),
+    fontface = "italic"
+  ) +
+  geom_hline(
+    yintercept = c(1, -1) * log2(diff_sig_param[[params$tgt2]]$fc),
+    linetype = 2, colour = "grey"
+  ) +
+  geom_vline(
+    xintercept = c(1, -1) * log2(diff_sig_param[[params$tgt1]]$fc),
+    linetype = 2, colour = "grey"
+  ) +
+  annotate(
+    "text",
+    x = min(x_lim), y = max(y_lim), vjust = 1, hjust = 0,
+    label = paste(
+      "rho == ",
+      cor(
+        dplyr::select(df, ends_with("logFC")), use = "pairwise.complete.obs"
+      )[1, 2] %>%  round(3)
+    ),
+    parse = TRUE, size = 3.4
+  ) +
+  geom_xsideboxplot(
+    aes(
+      x = !!sym(glue("{short_names$comp1} logFC")), 
+      y = !!sym(glue("{short_names$comp2} status")),
+      fill = !!sym(glue("{short_names$comp2} status"))
+    ), 
+    data = . %>% 
+      dplyr::filter(!is.na(!!sym(glue("{short_names$comp1} logFC")))),
+    orientation = "y", colour = "grey20", show.legend = FALSE
+  ) +
+  geom_ysideboxplot(
+    aes(
+      x = !!sym(glue("{short_names$comp1} status")),
+      y = !!sym(glue("{short_names$comp2} logFC")),
+      fill = !!sym(glue("{short_names$comp1} status"))
+    ),
+    data = . %>% 
+      dplyr::filter(!is.na(!!sym(glue("{short_names$comp2} logFC")))),
+    colour = "grey20", orientation = "x", show.legend = FALSE
+  ) +
+  scale_x_continuous() +
+  scale_y_continuous() +
+  scale_ysidex_discrete(
+    position = "top",     
+    labels = \(x) paste(short_names$comp1, x) %>% str_wrap(15)
+  ) +
+  scale_xsidey_discrete(
+    labels = \(x) paste(short_names$comp2, x) %>% str_wrap(15)
+  ) +
+  scale_colour_manual(
+    values = pw_cols, 
+    labels = \(x) pw_relabel(x) %>% str_replace_all(" - ", "\n"),
+    name = "Combined Status"
+  ) +
+  scale_fill_manual(values = full_palette) +
+  theme(
+    ggside.panel.scale.x = 0.1 + 0.05 * length(levels(df[[glue("{short_names$comp2} status")]])),
+    ggside.panel.scale.y = 0.1 + 0.025 * length(levels(df[[glue("{short_names$comp1} status")]])),
+    ggside.axis.text.x.top = element_text(angle = 90, hjust = 0, vjust = 0.5),
+    legend.position = "bottom",
+    axis.title.y.left = element_text(vjust = -10, hjust = 0.4),
+    axis.title.x.bottom = element_text(hjust = 0.45)
+  )
+```
+
+
+#### logFC By Region
+
+```{r plot-dbwin-by-region, fig.cap = glue("*Comparative changes in both ", glue_collapse(comp_labels, sep = " and "), ", separated by defined gene-centric regions. The window with most extreme combined change in signal for each region is shown with any protein-coding genes labelled as previously. The range around zero used for range-based hypothesis testing is indicated with grey dashed lines.*")}
+df %>% 
+  arrange(status) %>% 
+  ggplot(
+    aes(
+      x = !!sym(glue("{short_names$comp1} logFC")), 
+      y = !!sym(glue("{short_names$comp2} logFC")),
+      colour = status
+    )
+  ) +
+  geom_point(
+    data = . %>% dplyr::filter(!str_detect(status, "Undetected"))
+  ) +
+  geom_label_repel(
+    aes(label = label),
+    data = . %>% 
+      mutate(
+        across(ends_with("logFC"), list(sq = \(x) x^2)),
+        diam = (
+          !!sym(glue("{short_names$comp1} logFC_sq")) + 
+            !!sym(glue("{short_names$comp2} logFC_sq"))
+        )
+      ) %>% 
+      dplyr::filter(diam > 1) %>% 
+      arrange(desc(diam)) %>% 
+      dplyr::slice(1:10, .by = c(status, region)) %>% 
+      mutate(
+        label = map_chr(
+          gene_name, 
+          \(x) paste(intersect(x, prot_genes), collapse = "; ")
+        ) %>% 
+          str_wrap(15) %>% 
+          str_trunc(30) 
+      ) %>% 
+      dplyr::filter(label != "", !grepl("Unchanged.+Unchanged", status)) %>% 
+      dplyr::slice(1, .by = c(status, region)),
+    size = 3, show.legend = FALSE, fill = rgb(1, 1, 1, 0.8),
+    fontface = "italic"
+  ) +
+  geom_hline(
+    yintercept = c(1, -1) * log2(diff_sig_param[[params$tgt2]]$fc),
+    linetype = 2, colour = "grey"
+  ) +
+  geom_vline(
+    xintercept = c(1, -1) * log2(diff_sig_param[[params$tgt1]]$fc),
+    linetype = 2, colour = "grey"
+  ) +
+  geom_smooth(
+    data = . %>% 
+      dplyr::filter(!grepl("Undetected", status)),
+    se = FALSE, colour = "grey40", method = MASS::rlm
+  ) +
+  geom_text(
+    aes(label = label),
+    data = . %>%
+      dplyr::filter(!grepl("Undetected", status)) %>% 
+      dplyr::select(region, ends_with("logFC")) %>% 
+      split(.$region) %>% 
+      mclapply(
+        \(x) {
+          tibble(
+            cor = cor(dplyr::select(x, ends_with("logFC")))[1, 2],
+            "{short_names$comp1} logFC" := min(x[[glue("{short_names$comp1} logFC")]]),
+            "{short_names$comp2} logFC" := max(x[[glue("{short_names$comp2} logFC")]])
+          )
+        }, mc.cores = threads
+      ) %>% 
+      bind_rows(.id = "region") %>% 
+      mutate(
+        label = paste("rho ==", round(cor, 3)),
+        "{short_names$comp1} logFC" := min(!!sym(glue("{short_names$comp1} logFC"))),
+        "{short_names$comp2} logFC" := max(!!sym(glue("{short_names$comp2} logFC")))
+      ),
+    colour = "grey20", parse = TRUE, vjust = 1, hjust = 0, size = 3.5
+  ) +
+  facet_wrap(~region) +
+  scale_x_continuous() +
+  scale_y_continuous() +
+  scale_colour_manual(
+    values = pw_cols,
+    labels = \(x) pw_relabel(x) %>% str_replace_all(" - ", "\n"),
+    name = "Combined Status"
+  ) +
+  theme(legend.position = "bottom")
+```
+
+
+
+`r if (has_features) "#### logFC By Feature"`
+
+```{r plot-dbwin-by-feature, echo = has_features, fig.cap = glue("*Comparative changes in both ", glue_collapse(comp_labels, sep = " and "), ", separated by feature. The range with most extreme combined change in signal for each separate feature is shown with any protein-coding genes labelled as previously, noting that combined ranges may map to multiple features. The range around zero used for range-based hypothesis testing is indicated with grey dashed lines.*")}
+if (has_features) {
+  df %>% 
+    unnest(feature, keep_empty = TRUE) %>% 
+    mutate(
+      feature = str_replace_na(feature, "no_feature") %>% 
+        fct_infreq() %>% 
+        fct_lump_n(8)
+    ) %>% 
+    arrange(status) %>% 
+    ggplot(
+      aes(
+        x = !!sym(glue("{short_names$comp1} logFC")), 
+        y = !!sym(glue("{short_names$comp2} logFC")),
+        colour = status
+      )
+    ) +
+    geom_point(
+      data = . %>% dplyr::filter(!str_detect(status, "Undetected"))
+    ) +
+    geom_label_repel(
+      aes(label = label),
+      data = . %>% 
+        mutate(
+          across(ends_with("logFC"), list(sq = \(x) x^2)),
+          diam = (
+            !!sym(glue("{short_names$comp1} logFC_sq")) + 
+              !!sym(glue("{short_names$comp2} logFC_sq"))
+          )
+        ) %>% 
+        dplyr::filter(diam > 1) %>% 
+        arrange(desc(diam)) %>% 
+        dplyr::slice(1:10, .by = c(status, feature)) %>% 
+        mutate(
+          label = map_chr(
+            gene_name, 
+            \(x) paste(intersect(x, prot_genes), collapse = "; ")
+          ) %>% 
+            str_wrap(15) %>% 
+            str_trunc(30) 
+        ) %>% 
+        dplyr::filter(label != "", !grepl("Unchanged.+Unchanged", status)) %>% 
+        dplyr::slice(1, .by = c(status, feature)),
+      size = 3, show.legend = FALSE, fill = rgb(1, 1, 1, 0.8),
+      fontface = "italic"
+    ) +
+    geom_hline(
+      yintercept = c(1, -1) * log2(diff_sig_param[[params$tgt2]]$fc),
+      linetype = 2, colour = "grey"
+    ) +
+    geom_vline(
+      xintercept = c(1, -1) * log2(diff_sig_param[[params$tgt1]]$fc),
+      linetype = 2, colour = "grey"
+    ) +
+    geom_smooth(
+      data = . %>% 
+        dplyr::filter(!grepl("Undetected", status)),
+      se = FALSE, colour = "grey40", method = MASS::rlm
+    ) +
+    geom_text(
+      aes(label = label),
+      data = . %>%
+        dplyr::filter(!grepl("Undetected", status)) %>% 
+        dplyr::select(feature, ends_with("logFC")) %>% 
+        split(.$feature) %>% 
+        mclapply(
+          \(x) {
+            tibble(
+              cor = cor(dplyr::select(x, ends_with("logFC")))[1, 2],
+              "{short_names$comp1} logFC" := min(x[[glue("{short_names$comp1} logFC")]]),
+              "{short_names$comp2} logFC" := max(x[[glue("{short_names$comp2} logFC")]])
+            )
+          }, mc.cores = threads
+        ) %>% 
+        bind_rows(.id = "feature") %>% 
+        mutate(
+          label = paste("rho ==", round(cor, 3)),
+          "{short_names$comp1} logFC" := min(!!sym(glue("{short_names$comp1} logFC"))),
+          "{short_names$comp2} logFC" := max(!!sym(glue("{short_names$comp2} logFC")))
+        ),
+      colour = "grey20", parse = TRUE, vjust = 1, hjust = 0, size = 3.5
+    ) +
+    facet_wrap(~feature) +
+    scale_x_continuous() +
+    scale_y_continuous() +
+    scale_colour_manual(
+      values = pw_cols, 
+      labels = \(x) pw_relabel(x) %>% str_replace_all(" - ", "\n"),
+      name = "Combined Status"
+    ) +
+    theme(legend.position = "bottom")
+}
+```
+
+#### Distribution By Region
+
+```{r status-by-region, fig.cap = glue("*Distribution of signal patterns by genomic regions as defined in earlier sections. Windows are only shown if signal was detected in both datasets. Segments where changes were detected in both comparisons are exploded.*")}
+combined_results %>% 
+  filter(!grepl("Undetected", status)) %>%
+  mutate(
+    status = pw_relabel(status) %>% fct_lump_prop(0.01)
+  ) %>%
+  plotSplitDonut(
+    outer = "status", inner = "region",
+    inner_palette = region_colours, outer_palette = pw_cols,
+    inner_glue = "{str_wrap(.data[[inner]], 12)}\nn = {comma(n, 1)}\n({percent(p,0.1)})",
+    outer_glue = "{str_wrap(.data[[outer]], 15)}\nn = {comma(n, 1)}\n({percent(p,0.1)})",
+    min_p = 0.03, label_alpha = 0, inner_label_colour = "white",
+    explode_outer = "Both (In|De)creased", explode_r = 0.15
+  ) %>% 
+  .[[1]]
+```
+
+`r if (has_features) "#### Distribution By Feature"`
+
+```{r status-by-feature, echo = has_features, fig.cap = glue("*Distribution of signal patterns by external features as defined in earlier sections, noting again that features may be overlapping and loci may be mapped to multiple features. Features are grouped to capture 99% of mappings.*")}
+if (has_features) {
+  combined_results %>% 
+    select(feature, status) %>% 
+    filter(!grepl("Undetected", status)) %>% 
+    as_tibble() %>% 
+    unnest(feature, keep_empty = TRUE) %>% 
+    mutate(
+      feature = str_replace_na(feature, "no_feature") %>% 
+        fct_infreq() %>% 
+        fct_lump_prop(0.01),
+      status  = fct_relabel(status, \(x) pw_relabel(x))
+    ) %>% 
+    summarise(n = dplyr::n(), .by = c(status, feature)) %>% 
+    ggplot(aes(n, fct_rev(feature), fill = fct_rev(status))) +
+    geom_col() +
+    geom_label(
+      aes(x = x, label = comma(n)),
+      data = . %>% 
+        arrange(feature, status) %>% 
+        mutate(x = cumsum(n) - 0.5 * n, .by = feature) %>% 
+        dplyr::filter(n > sum(n) * 0.01),
+      show.legend = FALSE, fill = "white", alpha = 0.7, size = 3
+    ) +
+    scale_x_continuous(expand = expansion(c(0, 0.05)), labels = comma) +
+    scale_fill_manual(values = pw_cols) +
+    labs(x = "Loci Mapped to Feature", y = "Feature", fill = "Combined Status")
+}
+```
+
+## Combined Signal Visualisation
+
+### Profile Heatmaps {.tabset}
+
+A series of profile heatmaps were generated for any set of pairwise comparisons with more than `r min(map_dbl(heat_params, \(x) x$min_ranges))` ranges, and where signal was detected as changed in at least one of the comparisons.
+If comparing two targets, peaks were centred at the mid-point between the ranges of individual maximal signal.
+If only one target is detected within a range, peaks are centred at the range with maximal signal.
+Scales for fill and average signal (both logCPM) are held constant across all plots for easier comparison between groups.
+
+```{r form-profile-heatmaps}
+min_ranges <- min(map_dbl(heat_params, \(x) x$min_ranges))
+max_ranges <- max(map_dbl(heat_params, \(x) x$max_ranges))
+## Place the centre as the range centre based on the pairwise setup
+sig_ranges <- combined_results %>%
+  subset(grepl("(In|De)creased", status)) %>% 
+  subset(!grepl("Undetected", status)) %>% 
+  colToRanges("centre") %>% 
+  splitAsList(.$status) %>% 
+  .[map_int(., length) >= min_ranges] %>% 
+  endoapply(granges) %>% 
+  endoapply(unique) %>% 
+  endoapply(
+    \(x) {
+      if (length(x) > max_ranges) {
+        i <- sample.int(length(x), max_ranges)
+        x <- sort(x[i])
+      }
+      x
+    }
+  )
+## Hardwire to the first bw_type. Can't be different...
+## Does this need to go into a separate spot for heat or pairwise params?
+bw_type <- match.arg(heat_params[[1]]$bw_type, c("FE", "coverage"))
+bw_tag <- c(coverage = "treat_pileup", FE = "FE")[[bw_type]]
+fill_type <- c(coverage = "logCPM", FE = "log Enrichment")[[bw_type]]
+bwfl <- seq_len(2) %>% 
+  lapply(
+    \(i) here::here(
+      all_paths$macs2, targets[[i]], 
+      "{targets[[i]]}_{treat_levels[[i]]}_merged_{bw_tag}.bw"
+    )
+  ) %>% 
+  lapply(glue) %>% 
+  unlist() %>% 
+  unique() %>% 
+  setNames(str_remove_all(basename(.), "_merged.+")) %>% 
+  BigWigFileList()
+prof_widths <- seq_len(2) %>% 
+  lapply(
+    \(i) {
+      heat_params[[i]]$width %>% 
+        rep_len(2) %>% 
+        setNames(
+          paste0(targets[[i]], "_", treat_levels[[i]])
+        )
+    }
+  ) %>% 
+  unlist() %>% 
+  .[names(bwfl)]
+n_bins <- max(map_dbl(heat_params, pluck, "n_bins"))
+## Get the profile data
+sig_profiles <- sig_ranges %>% 
+  mclapply(
+    \(x) {
+      ## step through each bwfl separately to ensure variable widths
+      gr_as_list <- names(bwfl) %>% 
+        lapply(
+          \(i) {
+            getProfileData(
+              bwfl[[i]], x, upstream = prof_widths[[i]] / 2, bins = n_bins,
+              log = TRUE
+            )
+          }
+        )
+      names(gr_as_list) <- names(bwfl)
+      gr_as_list
+    },
+    mc.cores = min(length(.), threads)
+  ) 
+## Run as a list to enable using different gradients
+p_list <- sig_profiles %>% 
+  lapply(GRangesList) %>% 
+  lapply(unlist) %>% 
+  lapply(names_to_column, "name") %>% 
+  lapply(
+    mutate, 
+    target = str_extract(name, paste(targets, collapse = "|")),
+    treat = str_remove_all(
+      name, paste0("^(", paste(targets, collapse = "|"), ")_")
+    ),
+    name = str_replace_all(
+      name, paste0("^(", paste(targets, collapse = "|"), ")_"), "\\1: "
+    )
+  ) %>% 
+  mclapply(
+    \(x) {
+      x %>% 
+        splitAsList(.$target) %>% 
+        lapply(plotProfileHeatmap, facetX = "name") %>% 
+        lapply(\(p) p$data) %>% 
+        bind_rows() %>% 
+        mutate(
+          range = range %>% 
+            GRanges() %>% 
+            resize(width = 1, fix = 'center') %>% 
+            as.character() 
+        )
+    },
+    mc.cores = threads
+  )
+x_axis <- list(
+  ggplot(data.frame(x = c(0, 1)), aes(x = x)) + geom_blank() +
+    theme_void() + 
+    theme(axis.title.x = element_text()) + 
+    labs(x = "Distance From Centre (kb)")
+)
+## Wrap using patchwork
+profile_heatmaps <- p_list %>% 
+  lapply(
+    function(p){
+      df <- p %>% 
+        mutate(treat = factor(treat, levels = unique(unlist(treat_levels)))) %>% 
+        mutate(score = scale(score)[,1], .by = target)
+      rng_levels <- df %>% 
+        dplyr::filter(abs(bp) <= min(prof_widths / 10)) %>% 
+         mutate(rank  = rank(-score), .by = c(name, target, treat)) %>% 
+        mutate(ave_rank = mean(log(rank)), .by = range) %>% 
+        arrange(ave_rank) %>% 
+        pull(range) %>% 
+        rev() %>% 
+        unique()
+      df$range <- factor(df$range, levels = rng_levels)
+      sidey_lim <- df %>% 
+        summarise(mn = mean(score), .by = c(position, name)) %>%
+        pull("mn") %>% 
+        range()
+      ## Plot each target separately then merge using patchwork
+      df %>% 
+        split(.$target) %>% 
+        lapply(
+          function(x) {
+            tgt <- unique(x$target)
+            p <- x %>% 
+              ggplot(aes(bp, range)) +
+              geom_tile(aes(fill = score)) +
+              geom_xsideline(
+                aes(y = y, colour = treat),
+                data = . %>% 
+                  summarise(
+                    y = mean(score), .by = c(position, bp, treat, name)
+                  )
+              ) +
+              facet_grid(cols = vars(name)) +
+              scale_x_continuous(
+                expand = rep_len(0, 4), labels = comma_format(scale = 1e-3),
+                name = NULL
+              ) +
+              scale_y_discrete(expand = rep_len(0, 4)) +
+              scale_xsidey_continuous(limits = sidey_lim) +
+              scale_colour_manual(values = treat_colours, name = "Treat") +
+              scale_fill_gradientn(
+                colours = heat_params[[tgt]]$gradient,
+                name = glue("{tgt}")
+              ) +
+              theme(
+                ggside.panel.scale.x = 0.3,
+                panel.grid = element_blank(),
+                axis.text.y = element_blank(),
+                axis.ticks.y = element_blank(),
+                axis.title.y = element_blank()
+              )
+            p
+          }
+        )
+    }
+  ) %>% 
+  lapply(
+    \(p) {
+      p[[1]] <- p[[1]] +
+        geom_text(
+          aes(label = label),
+          data = p[[1]]$data %>% 
+            summarise(
+              label = glue("n = {comma(length(levels(range)))}"),
+              bp = min(bp), 
+              range = levels(range)[[1]],
+              name = name[[1]]
+            ),
+          hjust = -0.1, vjust = -0.2#, fontface = "bold"
+        )
+      a1 <- area(1, 1, 40, 1)
+      a2 <- area(1, 2, 40, 2)
+      a3 <- area(41, 1, 41, length(p))
+      design <- c(a1, a2, a3)
+      if (length(p) == 1) design <- c(a1, a3)
+      wrap_plots(c(p, x_axis), design = design) + plot_layout(guides = "collect")
+    }
+  )
+```
+
+
+```{r plot-all-profile-heatmaps}
+htmltools::tagList(
+  lapply(
+    seq_along(profile_heatmaps),
+    function(i) {
+      ## Export the image
+      pw <- names(profile_heatmaps)[[i]] 
+      pw_name <- pw %>% 
+        str_replace_all(
+          "(.+) - (.+)", 
+          paste(short_names$comp1, "\\1 -", short_names$comp2, "\\2")
+        )
+      img_out <- file.path(
+        fig_path,
+        pw %>% 
+          str_to_lower() %>% 
+          str_replace_all(
+            "(.+) - (.+)", 
+            paste0(
+              comp_names$comp1, "-\\1-", 
+              comp_names$comp2, "-\\2-profile_heatmap.", fig_type
+            )
+          )
+      )
+      n_ranges <- length(sig_ranges[[i]])
+      fig_fun(
+        filename = img_out, width = fw,
+        height = min(3.5 + fh * n_ranges / 1.5e3, fh)
+      )
+      print(profile_heatmaps[[i]])
+      dev.off()
+      
+      ## Create html tags
+      fig_link <- str_extract(img_out, "assets.+")
+      cp <- htmltools::tags$em(
+        glue(
+          "
+        {comma(n_ranges)} overlapping ranges were defined as showing the 
+        pattern {pw_name}. Ranges were centered at the midpoint of the 
+        overlapping range, and ordered by taking the average signal rank across 
+        all merged {params$tgt1} samples within 150bp of the peak centre. In the case of
+        large sets of results, plots were restricted to {max_ranges} ranges. Values 
+        shown are scaled {fill_type} values taking the {bw_type} bigwig files produced by 
+        macs callpeak.
+        "
+        )
+      )
+      htmltools::div(
+        htmltools::div(
+          id = img_out %>% 
+            basename() %>% 
+            str_remove_all(glue(".{fig_type}$")) %>% 
+            str_to_lower() %>% 
+            str_replace_all("_", "-"),
+          class = "section level4",
+          htmltools::h4(pw_name),
+          htmltools::div(
+            class = "figure", style = "text-align: center",
+            htmltools::img(src = fig_link, width = "100%"),
+            htmltools::tags$caption(cp)
+          )
+        )
+      )
+    }
+  )
+)
+```
+
+### Most Highly Ranked Loci {.tabset}
+
+```{r prepare-plot-objects}
+#cb <- config$genome$build %>% 
+ # str_to_lower() %>% 
+ # paste0(".cytobands") 
+#data(list = cb)
+#bands_df <- get(cb)
+#stopifnot(
+#  colnames(bands_df) == c("chrom", "chromStart", "chromEnd", "name", "gieStain")
+#)
+## Setup the coverage 
+bwfl <- seq_len(2) %>% 
+  lapply(
+    \(i) tibble(
+      target = targets[[i]],
+      short_name = short_names[[i]],
+      treat = unlist(treat_levels[[i]])
+    )
+  ) %>% 
+  bind_rows() %>% 
+  distinct(!!!syms(colnames(.))) %>% 
+  mutate(
+    bw = here::here(
+      all_paths$macs2, target, 
+      glue("{target}_{treat}_merged_treat_pileup.bw")
+    ) %>% 
+      setNames(treat)
+  ) %>% 
+  split(.$short_name) %>% 
+  lapply(pull, "bw") %>% 
+  lapply(BigWigFileList)
+line_col <- bwfl %>% lapply(\(x) treat_colours[names(x)])
+## Coverage annotations. 
+annot <- dsa_results %>% 
+  lapply(\(x) splitAsList(x, x$status)) %>% 
+  lapply(endoapply, GenomicRanges::reduce)
+annot_col <- direction_colours
+## Coverage y-limits
+max_ranges <- comp_names %>% 
+  lapply(
+    \(x) {
+      cols <- paste0(x, "_log", c("CPM", "FC"))
+      combined_results %>% 
+        select(all_of(cols)) %>% 
+        mutate(
+          max = !!sym(cols[[1]]) + !!sym(cols[[2]])
+        ) %>% 
+        arrange(-1 * max) %>% 
+        .[1:100] %>% 
+        granges() %>% 
+        resize(width = 2*width(.), fix = "center")
+    }
+  ) %>% 
+  GRangesList() %>% 
+  unlist()
+y_lim <- bwfl %>% 
+  lapply(
+    \(x) {
+      lapply(x, import.bw, which = max_ranges) %>% 
+        GRangesList() %>% 
+        unlist()
+    }
+  ) %>% 
+  lapply(\(x) c(0, max(x$score)))
+## The features track
+feat_gr <- list(Regions = endoapply(gene_regions, granges))
+if (has_features) {
+  feat_gr <- c(
+    feat_gr,
+    lapply(features, \(x) endoapply(splitAsList(x, x$feature), granges))
+  )
+}
+hfgc_feat_col <- feat_gr %>% 
+  lapply(
+    \(x) c(colours$regions, feature_colours)[names(x)]
+  )
+featnames <- names(feat_gr) %>% str_sep_to_title(replacement = "\n")
+## The genes track defaults to transcript models
+hfgc_genes <- read_rds(
+  here::here("output", "annotations", "trans_models.rds")
+)
+gene_col <- "grey"
+collapseTrans <- "auto"
+if (length(rna)) {
+  gene_status <- rna %>% 
+    bind_rows(.id = "dataset") %>% 
+    arrange(FDR) %>% 
+    distinct(gene_id, .keep_all = TRUE) %>% 
+    addDiffStatus() %>% 
+    droplevels() %>%
+    distinct(gene_id, .keep_all = TRUE) %>% 
+    mutate(status = setNames(status, gene_id)) %>% 
+    pull("status")
+  hfgc_genes$status <- gene_status[hfgc_genes$gene] %>% 
+    fct_na_value_to_level("Undetected")
+  hfgc_genes <- splitAsList(hfgc_genes, hfgc_genes$status)
+  gene_col <- direction_colours[names(hfgc_genes)]
+  collapseTrans <- list(
+    Increased = "auto", Decreased = "auto",
+    Unchanged = "meta", Undetected = "meta"
+  )[names(hfgc_genes)]
+}
+```
+
+An initial set of ranges is shown below, based on merged p-values from Wilkinson's method where both targets were detected.
+
+```{r grl_most_sig}
+grl_most_sig <- combined_results %>%
+  subset(str_detect(status, "(In|De)creased")) %>% 
+  subset(!str_detect(status, "Undetected")) %>% 
+  arrange(merged_fdr) %>% 
+  splitAsList(.$status) %>% 
+  .[map_int(., length) > 0] %>% 
+  endoapply(\(x) x[1])
+```
+
+
+```{r plot-top-ranges-sig, echo=FALSE}
+.makeCaption <- function(gr, feat = "") {
+  status <- gr$status %>% 
+    str_replace_all(
+      "(.+) - (.+)", paste(short_names$comp1, "\\1 -", short_names$comp2, "\\2")
+    )
+  gn <- glue_collapse(unlist(gr$gene_name), sep = ", ", last = " & ")
+  if (length(gn)) {
+    gn <- glue("The most probable regulatory targets include ", gn, ". ")
+  } else {
+    gn <- ""
+  }
+  reg <- glue_collapse(gr$region, sep = ", ", last = " & ")
+  reg <- ifelse(
+    grepl("^[AEIOUaeiou]", reg), paste("an", reg), paste("a", reg)
+  )
+  reg <- ifelse(grepl("on$", reg), paste0(reg, "ic"), reg)
+  feat <- c()
+  if (has_features) {
+    feat <- glue_collapse(unique(unlist(gr$feature)), sep = ", ", last = " & ")
+    feat <- ifelse(
+      grepl("^[AEIOUaeiou]", feat), paste("an", feat), paste("a", feat)
+    )
+    feat <- glue(
+      "When comparing to external features, this locus was most associated with those designated as {feat}."
+    )
+  }
+  w <- width(gr)
+  rng <- as.character(gr)
+  glue(
+    "This {comma(w)}bp region ({rng}) was classified as {status}, and overlaps {reg} region. ",
+    "The highlighted region indicates the entire range, whilst results from individual analyses are indicated by coloured bars above each individual track. ",
+    "Colours indicate status before any reclassification has taken place and can be additionally used to make an assessment of any reclassification in these cases. ",
+    gn, feat
+  )
+}
+htmltools::tagList(
+  lapply(
+    seq_along(grl_most_sig),
+    function(i) {
+      ## Set the key variables
+      x <- grl_most_sig[[i]]
+      pw <- names(grl_most_sig)[[i]]
+      pw_name <- pw %>% 
+        str_replace_all(
+          "(.+) - (.+)", 
+          paste(short_names$comp1, "\\1 -", short_names$comp2, "\\2")
+        )
+      img_out <- file.path(
+        fig_path,
+        pw %>% 
+          str_to_lower() %>% 
+          str_replace_all(
+            "(.+) - (.+)", 
+            paste0(
+              comp_names$comp1, "-\\1-", 
+              comp_names$comp2, "-\\2-by-sig.", fig_type
+            )
+          )
+      )
+      
+      ## Export the image
+      fig_fun(filename = img_out, width = fw, height = fh)
+      plotHFGC(
+        x,
+        hic = hic,
+        features = feat_gr, featcol = hfgc_feat_col, featname = featnames,
+        featsize = max(1, 0.8 * length(feat_gr)), featstack = "dense",
+        genes = hfgc_genes, genecol = gene_col, 
+        genesize = rep_len(c(2, 1), length(hfgc_genes)),
+        coverage = bwfl, linecol = line_col,  ylim = y_lim,
+        annotation = annot, annotcol = direction_colours,
+        #cytobands = bands_df,
+        collapseTranscripts = collapseTrans, maxTrans = 15,
+        zoom = 20, max = max(1e4, width(range(x))),
+        col.title = "black", background.title = "white", 
+        rotation.title = 90, showAxis = FALSE, fontsize = 10,
+        highlight = rgb(0, 0, 1, 0.3)
+      )
+      dev.off()
+      ## Create html tags
+      fig_link <- str_extract(img_out, "assets.+")
+      cp <- htmltools::tags$caption(
+        htmltools::tags$em(.makeCaption(x))
+      )
+      htmltools::div(
+        id = img_out %>% 
+          basename() %>% 
+          str_remove_all(glue(".{fig_type}$")) %>% 
+          str_to_lower() %>% 
+          str_replace_all("_", "-"),
+        class = "section level4",
+        htmltools::h4(pw_name),
+        htmltools::div(
+          class = "figure", style = "text-align: center",
+          htmltools::img(src = fig_link, width = 960),
+        ),
+        htmltools::div(class = "figure-caption", cp)
+      )
+    }
+  )
+)  
+```
+
+
+### Windows With The Strongest Signal {.tabset}
+
+Loci found with differential signal tend to show the most extreme change where signal levels are low, whilst where signal is high the changes tend to be well statistically supported but less pronounced.
+For the following set of plots, the locus with the highest average signal across each group (e.g. Both Increased, Both Decreased etc) is shown.
+It is anticipated that change will appear less visually striking, whilst the actual signal should appear relatively strong.
+For all plots in this subsection, significant change was detected in at least of comparison.
+
+```{r grl-to-plot-avexpr}
+grl_to_plot <- combined_results %>% 
+  filter_by_non_overlaps(grl_most_sig) %>% 
+  subset(str_detect(status, "(In|De)creased")) %>% 
+  subset(!str_detect(status, "Undetected")) %>% 
+  arrange(
+    (-1) * case_when(
+      !!sym(paste0(comp_names$comp1, "_status")) == "Undetected" ~ !!sym(paste0(comp_names$comp2, "_logCPM")),
+            !!sym(paste0(comp_names$comp2, "_status")) == "Undetected" ~ !!sym(paste0(comp_names$comp1, "_logCPM")),
+      TRUE ~ (
+        !!sym(paste0(comp_names$comp1, "_logCPM")) +
+          !!sym(paste0(comp_names$comp2, "_logCPM"))
+      )
+    )
+  ) %>% 
+  splitAsList(.$status) %>% 
+  .[map_int(., length) > 0] %>% 
+  endoapply(\(x) granges(x[1])) %>% 
+  setNames(
+    names(.) %>% 
+      str_replace_all("Increased - Increased", "Both Increased") %>% 
+      str_replace_all("Decreased - Decreased", "Both Decreased") 
+  ) %>% 
+  .[order(names(.))]
+```
+
+
+```{r plot-top-ranges-aveexpr, echo=FALSE}
+htmltools::tagList(
+  lapply(
+    seq_along(grl_to_plot),
+    function(i) {
+      ## Set the key variables
+      pw <- names(grl_to_plot)[[i]]
+      pw_name <- pw %>% 
+        str_replace_all(
+          "(.+) - (.+)", 
+          paste(short_names$comp1, "\\1 -", short_names$comp2, "\\2")
+        )
+      img_out <- file.path(
+        fig_path,
+        pw %>% 
+          str_to_lower() %>% 
+          str_replace_all(
+            "(.+) - (.+)", 
+            paste0(
+              comp_names$comp1, "-\\1-", 
+              comp_names$comp2, "-\\2-by-aveexpr.", fig_type
+            )
+          )
+      )
+      ## Export the image
+      fig_fun(filename = img_out, width = fw, height = fh)
+      plotHFGC(
+        grl_to_plot[[i]],
+        hic = hic,
+        features = feat_gr, featcol = hfgc_feat_col, featname = featnames,
+        featsize = max(1, 0.8 * length(feat_gr)), featstack = "dense",
+        genes = hfgc_genes, genecol = gene_col, 
+        genesize = rep_len(c(2, 1), length(hfgc_genes)),
+        coverage = bwfl, linecol = line_col,  ylim = y_lim,
+        annotation = annot, annotcol = direction_colours,
+        #cytobands = bands_df,
+        collapseTranscripts = collapseTrans, maxTrans = 15,
+        zoom = 20, max = max(1e4, width(range(grl_to_plot[[i]]))),
+        col.title = "black", background.title = "white", 
+        rotation.title = 90, showAxis = FALSE, fontsize = 10,
+        highlight = rgb(0, 0, 1, 0.3)
+      )
+      dev.off()
+      ## Create html tags
+      fig_link <- str_extract(img_out, "assets.+")
+      cp <- htmltools::tags$caption(
+        htmltools::tags$em(
+          .makeCaption(grl_to_plot[[i]])
+        )
+      )
+      htmltools::div(
+        id = img_out %>% 
+          basename() %>% 
+          str_remove_all(glue(".{fig_type}$")) %>% 
+          str_to_lower() %>% 
+          str_replace_all("_", "-"),
+        class = "section level4",
+        htmltools::h4(pw_name),
+        htmltools::div(
+          class = "figure", style = "text-align: center",
+          htmltools::img(src = fig_link, width = 960),
+        ),
+        htmltools::div(class = "figure-caption", cp)
+      )
+    }
+  )
+)  
+```
+
+### Windows With The Largest Change {.tabset}
+
+As a contrast to the previous set of results, the locus within each group where the combined logFC is the furthest from zero was selected.
+These positions may expected to show more pronounced change, but an overall lower signal level.
+The same limits for the y-axis are used for this set of plots as for the previous set.
+
+By taking the two set of visualisations in this context, judgements can be made about the true relevance of similar loci.
+
+```{r grl-to-plot-logfc}
+grl_to_plot <- combined_results %>% 
+  filter_by_non_overlaps(grl_most_sig) %>% 
+  subset(str_detect(status, "(In|De)creased")) %>% 
+  subset(!str_detect(status, "Undetected")) %>% 
+  arrange(
+    (-1) * case_when(
+      !!sym(paste0(comp_names$comp1, "_status")) == "Undetected" ~ (!!sym(paste0(comp_names$comp2, "_logFC")))^2,
+      !!sym(paste0(comp_names$comp2, "_status")) == "Undetected" ~ (!!sym(paste0(comp_names$comp1, "_logFC")))^2,
+      TRUE ~ (
+        (!!sym(paste0(comp_names$comp1, "_logFC")))^2 +
+          (!!sym(paste0(comp_names$comp2, "_logFC")))^2
+      )
+    )
+  ) %>% 
+  splitAsList(.$status) %>% 
+  .[map_int(., length) > 0] %>% 
+  endoapply(\(x) granges(x[1])) %>% 
+  setNames(
+    names(.) %>% 
+      str_replace_all("Increased - Increased", "Both Increased") %>% 
+      str_replace_all("Decreased - Decreased", "Both Decreased") 
+  ) %>% 
+  .[order(names(.))]
+```
+
+
+```{r plot-top-ranges-logfc, echo=FALSE}
+htmltools::tagList(
+  lapply(
+    seq_along(grl_to_plot),
+    function(i) {
+      ## Export the image
+      pw <- names(grl_to_plot)[[i]]
+      pw_name <- pw %>% 
+        str_replace_all(
+          "(.+) - (.+)", 
+          paste(short_names$comp1, "\\1 -", short_names$comp2, "\\2")
+        )
+      img_out <- file.path(
+        fig_path,
+        pw %>% 
+          str_to_lower() %>% 
+          str_replace_all(
+            "(.+) - (.+)", 
+            paste0(
+              comp_names$comp1, "-\\1-", 
+              comp_names$comp2, "-\\2-by-lfc.", fig_type
+            )
+          )
+      )
+      fig_fun(filename = img_out, width = fw, height = fh)
+      plotHFGC(
+        grl_to_plot[[i]],
+        hic = hic,
+        features = feat_gr, featcol = hfgc_feat_col, featname = featnames,
+        featsize = max(1, 0.8 * length(feat_gr)), featstack = "dense",
+        genes = hfgc_genes, genecol = gene_col, 
+        genesize = rep_len(c(2, 1), length(hfgc_genes)),
+        coverage = bwfl, linecol = line_col,  ylim = y_lim,
+        annotation = annot, annotcol = direction_colours,
+        #cytobands = bands_df,
+        collapseTranscripts = collapseTrans, maxTrans = 15,
+        zoom = 20, max = max(1e4, width(range(grl_to_plot[[i]]))),
+        col.title = "black", background.title = "white", 
+        rotation.title = 90, showAxis = FALSE, fontsize = 10,
+        highlight = rgb(0, 0, 1, 0.3)
+      )
+      dev.off()
+      ## Create html tags
+      fig_link <- str_extract(img_out, "assets.+")
+      cp <- htmltools::tags$caption(
+        htmltools::tags$em(
+          .makeCaption(grl_to_plot[[i]])
+        )
+      )
+      htmltools::div(
+        id = img_out %>% 
+          basename() %>% 
+          str_remove_all(glue(".{fig_type}$")) %>% 
+          str_to_lower() %>% 
+          str_replace_all("_", "-"),
+        class = "section level4",
+        htmltools::h4(pw_name),
+        htmltools::div(
+          class = "figure", style = "text-align: center",
+          htmltools::img(src = fig_link, width = 960),
+        ),
+        htmltools::div(class = "figure-caption", cp)
+      )
+    }
+  )
+)  
+```
+
+## Enrichment Testing
+
+```{r msigdb}
+msigdb <- here::here(all_paths$annotation, "msigdb.rds") %>% read_rds()
+gs_url <- msigdb$gs_url[!duplicated(names(msigdb$gs_url))]
+enrich_method <- match.arg(enrich_params$method, c("great", "gene_id"))
+enrich_fun <- c(
+  great = ".great_enrich", gene_id = ".geneid_enrich"
+)[enrich_method]
+adj_method <- match.arg(enrich_params$adj, p.adjust.methods)
+net_layout <- c(network_params$layout, "fr")[[1]]
+ranges_by_status <- combined_results %>% 
+  subset(grepl("(In|De)creased", status)) %>% 
+  mutate(status = fct_rev(status)) %>% 
+  split(.$status) %>%  
+  endoapply(unique) %>% 
+  endoapply(select, gene_id) %>% 
+  .[map_int(., length) > 0] %>% 
+  setNames(pw_relabel(names(.))) 
+```
+
+`r desc_enrichment(enrich_method)`
+
+For all analyses below, the complete set of loci showing signal in either comparison were used as the background ranges.
+As such, if the majority of sites are showing change, there will be minimal opportunity for any pathways to emerge as enriched amongst the changed sites.
+Likewise, when very few sites are changed, no enrichment is likely to be observed.
+
+Only groups where change was detected in at least one comparison were tested, and as such, the following sets of loci were assessed.
+
+`r pander(as.list(names(ranges_by_status)))`
+
+All p-values will be adjusted using the `r adj_method` correction during testing, and gene-sets removed from the results (after adjustment) if fewer than `r enrich_params$min_sig` genes were mapped to them.
+For groups where no results were returned, no result tables or figures will be shown.
+
+```{r enrich-tests}
+enrich_by_status <- ranges_by_status %>% 
+  lapply(
+    \(x) {
+      args <- list(
+        test_ranges = x, db = msigdb, gtf = gtf$gene, bg = combined_results, 
+        genome = ucsc$build, threads = threads, adj_method = adj_method, 
+        min_sig = enrich_params$min_sig, params = region_params$promoters
+      )
+      do.call(enrich_fun, args)
+    }
+  ) 
+any_enrich <- enrich_by_status %>% 
+  map_int(\(x) sum(x$adj_p < enrich_params$alpha)) %>% 
+  as.logical() %>% 
+  any()
+tg_by_status <- enrich_by_status %>%
+  lapply(dplyr::filter, adj_p < enrich_params$alpha) %>% 
+  .[map_int(., nrow) > min(network_params$size)] %>% 
+  mclapply(
+    mutate,
+    p = ifelse(p > 0, p, 1e-16), prop = observed_gene_hits / gene_set_size ,
+    mc.cores = threads
+  ) %>% 
+    mclapply(
+      \(x) {
+        make_tbl_graph(
+          x, gs = x$gene_id, 
+          alpha = enrich_params$alpha, p_col = "adj_p", gs_col = "gs_name", 
+          hit_col = "observed_gene_hits", size_col = "gene_set_size", 
+          min_dist = network_params$max_distance, max_gs = max(network_params$size)
+        )
+      }, mc.cores = threads
+    )
+enrich_networks <- tg_by_status %>% 
+  lapply(
+    \(x) {
+      x %>% 
+        ggraph(layout = net_layout, weights = oc) +
+        geom_edge_link(aes(width = oc^2, alpha = oc^2)) +
+        geom_node_point(
+          aes(
+            fill = -log10(p), size = observed_gene_hits, stroke = 1.5 * prop
+          ),
+          shape = 21
+        ) +
+        geom_node_text(
+          aes(label = label, alpha = prop),
+          colour = "black", size = 3, 
+          data = . %>%
+            mutate(
+              label = str_replace_all(label, "_", " ") %>% 
+                str_trunc(60) %>% 
+                str_wrap(width = 18)
+            ),
+          repel = TRUE, bg.color = "white", bg.r = 0.1, 
+          max.overlaps = 10,
+        ) +
+        scale_x_continuous(expand = expansion(c(0.1, 0.1))) +
+        scale_y_continuous(expand = expansion(c(0.1, 0.1))) +
+        scale_fill_viridis_c(option = "inferno", begin = 0.2) +
+        scale_alpha(range = c(0.5, 1), trans = "sqrt") +
+        scale_size_continuous(range = c(1, 10)) +
+        scale_edge_width(range = c(1, 6), limits = c(0, 1)) +
+        scale_edge_alpha(range = c(0.1, 0.4), limits = c(0, 1))  +
+        guides(edge_alpha = "none", edge_width = "none", alpha = "none") +
+        labs(size = "Mapped\nGenes", fill = expr(paste("-", log[10], "p"))) +
+        theme_void() 
+    }
+  )
+any_networks <- as.logical(length(tg_by_status))
+```
+
+`r ifelse(any_enrich, "### Enrichment Result Tables {.tabset}", "No sets of ranges were found to be enriched for any gene-sets or pathways")`
+
+```{r enrich-result-tables, echo = FALSE}
+if (any_enrich) {
+  tagList(
+    enrich_by_status %>% 
+      lapply(dplyr::filter, adj_p < enrich_params$alpha) %>% 
+      bind_rows(.id = "status") %>% 
+      droplevels() %>% 
+      split(.$status) %>% 
+      lapply(
+        \(x) {
+          status <- unique(x$status)
+          id <- status %>% 
+            str_replace_all(" - ", "-") %>% 
+            str_replace_all(" +", "-") %>% 
+            str_to_lower() %>% 
+            paste0("-enrich-table")
+          cp <- htmltools::em(
+            glue(
+              "
+          Enrichment results for the set of {status} loci using an adjusted p-value 
+          ({adj_method}) < {enrich_params$alpha} to determine significance. 
+          The backround to determine relative enrichment was the entire set of 
+          sites contained in both comparisons. In the case of large numbers of 
+          significant gene-sets, results arelimited to the 100  most highly 
+          ranked. For gene-sets where the analysis has
+          returned a p-value of zero, the value <2e-16 will be printed. Where the 
+          identical set of genes were found represented by multiple gene-sets, only 
+          the most highly ranked gene-set is returned.
+          "
+            )
+          )
+          tbl <- x %>% 
+            dplyr::select(-status) %>% 
+            dplyr::slice(seq_len(100)) %>%
+            dplyr::select(-any_of(c("gene_id"))) %>% 
+            dplyr::select(
+              gs_name, genes_with_hits, contains("gene"), everything()
+            ) %>% 
+            distinct(genes_with_hits, .keep_all = TRUE) %>%
+            reactable(
+              sortable = TRUE, filterable = TRUE, showPageSizeOptions = TRUE,
+              columns = enrich_cols[colnames(.)],
+              details =  function(index){
+                htmltools::div(
+                  htmltools::tags$pre(
+                    str_wrap(
+                      paste(
+                        capture.output(x$genes_with_hits[index]), collapse = "\n"
+                      ),
+                      width = 120
+                    )
+                  )
+                )
+              },
+              elementId = id
+            )
+          tl <- tagList(
+            htmltools::tags$caption(cp),
+            tags$button(
+              tagList(fontawesome::fa("download"), "Download as CSV"),
+              onclick = glue("Reactable.downloadDataCSV('{id}','{id}_enrich_res.csv')")
+            ),
+            tags$button(
+              "Expand/Collapse All",
+              onclick = glue("Reactable.toggleAllRowsExpanded('{id}')")
+            ),
+            tags$button(
+              "Clear All Filters", onclick = glue("Reactable.setAllFilters('{id}', [])")
+            ),
+            tbl
+          )
+          htmltools::div(
+            id = id, class = "section level4", htmltools::h4(status), tl
+          )
+        }
+      )
+  )
+}
+```
+
+`r ifelse(any_networks, "### Enrichment Network Plots {.tabset}", "")`
+
+```{r plot-networks, echo = FALSE}
+if (any_networks) {
+  htmltools::tagList(
+    enrich_networks %>% 
+      names() %>% 
+      lapply(
+        \(x){
+          
+          ## Export the image
+          id <- x %>% 
+            str_replace_all(" - ", "-") %>% 
+            str_replace_all(" ", "-") %>% 
+            str_to_lower() %>% 
+            paste0("-enrichment-network")
+          img_out <- file.path(fig_path, paste0(id, ".", fig_type))
+          fig_fun(filename = img_out, width = fw, height = fh)
+          print(enrich_networks[[x]])
+          dev.off()
+          
+          ## Create html tags
+          fig_link <- str_extract(img_out, "assets.+")
+          cp <- htmltools::tags$caption(
+            htmltools::tags$em(
+              glue(
+                "Enrichment network for the set of loci considered as {x}. ",
+                "Node sizes reflect the number of genes mapped to each gene-set, ",
+                "with colour indicating statistical significance. ",
+                "Nodes with heavier borders reflect those where the number of ",
+                "mapped genes is a higher proportion of those within the gene-set, ",
+                "noting that some smaller gene-sets may have larger proportions ",
+                "of the possible genes mapped to a region within the set of loci."
+              )
+            )
+          )
+          htmltools::div(
+            id = id, class = "section level4", htmltools::h4(x),
+            htmltools::div(
+              class = "figure", style = "text-align: center",
+              htmltools::img(src = fig_link, width = 960),
+              cp
+            )
+          )
+        }
+      )
+  )
+}
+```
+
+
+## Region Analysis {.tabset}
+
+```{r load-localz}
+mlz_list <- here::here(params$localz) %>% read_rds()
+mlz_list <- mlz_list[!map_lgl(mlz_list, is.null)]
+names(mlz_list) <- names(mlz_list) %>% 
+  str_remove_all(params$full_comp) %>% 
+  str_replace_all("-(.+)_(.+)_localz.rds", "\\1 - \\2") %>% 
+  str_to_title() 
+localz_df <- mlz_list %>% 
+  lapply(slot, "multiLocalZscores") %>% 
+  lapply(pluck, "resumeTab") %>% 
+  bind_rows(.id = 'comparison') %>% 
+  dplyr::rename(region = name) %>% 
+  mutate(
+    p_value = 1 - pchisq(norm_zscore^2, 1),
+    adj.p_value = p.adjust(p_value, regioner_params$adj)
+  ) %>% 
+  mutate(
+    region = case_when(
+      region %in% names(regions) ~ regions[region],
+      TRUE ~ region
+    ) %>% 
+      factor(all_regions),
+    enrichment = log2(n_overlaps / mean_perm_test),
+    prop = n_overlaps / n_by_status[comparison],
+    comparison = pw_relabel(comparison)
+  ) %>% 
+  as_tibble()
+shifted_z <- mlz_list %>% 
+  lapply(slot, "multiLocalZscores") %>% 
+  lapply(
+    \(x) {
+      tbl <- as_tibble(x$shifed_ZSs)
+      tbl$shift <- x$shifts
+      tbl
+    }
+  ) %>% 
+  bind_rows(.id = 'comparison') %>% 
+  pivot_longer(
+    cols = -all_of(c("shift", "comparison")), names_to = "region", values_to = "Z"
+  ) %>% 
+  mutate(
+    region = case_when(
+      region %in% names(regions) ~ regions[region],
+      TRUE ~ region
+    ) %>% 
+      factor(all_regions),
+    Z = Z / sqrt(n_by_status[comparison]),
+    comparison =  pw_relabel(comparison)
+  ) 
+heat_col <- c(
+  rev(RColorBrewer::brewer.pal(9, "PuBuGn")),
+  RColorBrewer::brewer.pal(9, "YlOrRd")
+)
+```
+
+In addition to enrichment of pathways, the loci belonging to each pairwise grouping were assessed for their relationship to the pre-defined gene-regions`r ifelse(has_features, " and the supplied external features.", ".")`.
+The package `regioneReloaded` [@Malinverni2023-ee] was used, which uses a permutation-based strategy to determine the expected overlap between a random region-set and the regions of interest.
+This effectively defines a viable H~0~ against which the observed number of overlaps can be tested, accounting for the size of each type of region or feature.
+Using the Central Limit Theorem, the *normalised Z-scores* returned can be expected to to follow an approximate $\mathcal{N}(0,1)$ distribution, and these are used to regenerate adjusted p-values, as a more conservative alternative to those returned by the package.
+
+In addition to determining the strength of any overlaps with a given feature, distributions of shifted Z-scores can provide a measure of how these values are impacted by shifting the pairwise peaks within $\pm$ 5kb range around the detected peak.
+
+### Results Table
+
+```{r tbl-regioner, echo=FALSE}
+fs <- 12
+tbl_id <- 'localz-res-table'
+tbl <- localz_df %>% 
+  dplyr::select(
+    comparison, region, mean_perm_test, n_overlaps, prop, enrichment,
+    norm_zscore, adj.p_value
+  ) %>% 
+  arrange(desc(abs(norm_zscore))) %>% 
+  mutate(
+    source = str_extract(region, ".+: ") %>% 
+      str_remove_all(": ") %>% 
+      str_replace_na(""),
+    region = str_remove_all(region, ".+: ")
+  ) %>% 
+  dplyr::select(comparison, source, region, everything()) %>% 
+  dplyr::select(where(\(x) !all(x == ""))) %>% 
+  dplyr::mutate(
+    across(any_of("source"), \(x) str_replace(x, "$^", "GRAVI")),
+    Sig = adj.p_value < regioner_params$alpha
+  ) %>% 
+  reactable(
+    showPageSizeOptions = TRUE, filterable = TRUE,
+    columns = list(
+      comparison = colDef(
+        "Comparison",  minWidth = 150, maxWidth = 200,
+        filterInput = function(values, name) {
+          tags$select(
+            # Set to undefined to clear the filter
+            onchange = sprintf(
+              "Reactable.setFilter('%s', '%s', event.target.value || undefined)",
+              tbl_id, name
+            ),
+            # "All" has an empty value to clear the filter, and is the default option
+            tags$option(value = "", "All"),
+            lapply(unique(values), tags$option),
+            "aria-label" = sprintf("Filter %s", name),
+            style = "width: 100%; height: 28px;"
+          )
+        }
+      ),
+      source = colDef(
+        "Source", minWidth = 150, maxWidth = 120,
+        filterInput = function(values, name) {
+          tags$select(
+            # Set to undefined to clear the filter
+            onchange = sprintf(
+              "Reactable.setFilter('%s', '%s', event.target.value || undefined)",
+              tbl_id, name
+            ),
+            # "All" has an empty value to clear the filter, and is the default option
+            tags$option(value = "", "All"),
+            lapply(unique(values), tags$option),
+            "aria-label" = sprintf("Filter %s", name),
+            style = "width: 100%; height: 28px;"
+          )
+        }
+      ),
+      region = colDef(
+        "Region", minWidth = 150, maxWidth = 120,
+        style = \(value) {
+          bg <- do.call(
+            "rgb", 
+            c(region_colours, feature_colours)[[value]] %>% 
+              col2rgb() %>% 
+              .[,1] %>% 
+              divide_by(255) %>% 
+              as.list() %>% 
+              c(list(alpha = 0.7))
+          )
+          list(backgroundColor = bg)
+        },
+        filterInput = function(values, name) {
+          tags$select(
+            # Set to undefined to clear the filter
+            onchange = sprintf(
+              "Reactable.setFilter('%s', '%s', event.target.value || undefined)",
+              tbl_id, name
+            ),
+            # "All" has an empty value to clear the filter, and is the default option
+            tags$option(value = "", "All"),
+            lapply(unique(values), tags$option),
+            "aria-label" = sprintf("Filter %s", name),
+            style = "width: 100%; height: 28px;"
+          )
+        }
+      ),
+      mean_perm_test = colDef("Expected Overlaps", format = comma_col),
+      n_overlaps = colDef("Overlapping Peaks", format = comma_col),
+      enrichment = colDef(
+        "log<sub>2</sub> Enrichment", format = colFormat(digits = 2),
+        html = TRUE,
+        style = \(value) list(color = ifelse(value > 0, "black", "red"))
+      ),
+      prop = colDef("% Total Peaks", format = percent_col),
+      norm_zscore = colDef(
+        "Z", format = colFormat(digits = 3),
+        style = \(value) list(color = ifelse(value > 0, "black", "red"))
+      ),
+      adj.p_value = colDef(
+        glue("p<sub>{enrich_params$adj}</sub>"), html = TRUE,
+        cell = \(value) sprint_pval(value),
+        style = \(value) {
+          text_colour <- ifelse(
+            value < regioner_params$alpha,
+            "black", colours$direction[["unchanged"]]
+          )
+          list(color = text_colour)
+        }
+      ),
+      Sig = colDef(
+        show = FALSE,
+        filterMethod = JS("function(rows, columnId, filterValue) {
+          if (filterValue === true) {
+            return rows.filter(function(row) {
+              const OnlySignificant = row.values[columnId]
+              return OnlySignificant
+            })
+          }
+          return rows
+        }")
+      )
+    )[colnames(.)],
+    elementId = tbl_id,
+    defaultColDef = colDef(maxWidth = 90),
+    theme = reactableTheme(style = list(fontSize = fs))
+  )
+cp <- htmltools::em(
+  glue(
+    "
+    Results for association between each set of ranges taken in a pairwise manner,
+    with the genomic regions{ifelse(has_features, ' and the supplied external features.', '.')}
+    Expected overlaps are those obtained through random resampling of the genome
+    to match the changed regions. Enrichment is calculated taking log2 of
+    the ratio between observed and expected overlapping peaks.
+    "
+  )
+)
+tl <- tagList(
+  htmltools::tags$caption(cp),
+  tags$button(
+    tagList(fontawesome::fa("download"), "Download as CSV"),
+    onclick = glue(
+      "Reactable.downloadDataCSV('{tbl_id}', 'shared_localz_res.csv')"
+    )
+  ),
+  tags$button(
+    "Clear All Filters", onclick = glue("Reactable.setAllFilters('{tbl_id}', [])")
+  ),
+  tags$label(
+    tags$input(
+      type = "checkbox", 
+      onclick = glue("Reactable.setFilter('{tbl_id}', 'Sig', event.target.checked)")
+    ),
+    "Only show significant associations"
+  ),
+  tbl
+)
+htmltools::browsable(tl)
+```
+
+### Z-Score Heatmap
+
+```{r zscore-heatmap, fig.width = 1.1 * fw, fig.cap = glue("*Normalised Z-scores for each group, showing the effect of shifting ranges within a $\\pm$ {regioner_params$window/1e3}kb window around the existing peaks.*")}
+shifted_z %>% 
+  arrange(abs(shift), Z) %>% 
+  mutate(
+    region = fct_inorder(as.character(region)),
+    source = ifelse(region %in% regions, "Region", "Feature"),
+    comparison = str_replace_all(comparison, " - ", "\n")
+  ) %>% 
+  ggplot(aes(shift, fct_rev(region), fill = Z)) +
+  geom_raster() +
+  facet_grid(
+    cols = vars(comparison), rows = vars(source), 
+    scales = "free", space = "free"
+  ) +
+  scale_x_continuous(
+    expand = rep_len(0, 4), labels = \(x) x / 1e3, name = "Shift (kb)"
+  ) +
+  scale_y_discrete(expand = rep_len(0, 4), name = NULL) +
+  scale_fill_gradientn(
+    colours = heat_col,
+    limits = c(-1.05, 1.05) * max(abs(shifted_z$Z))
+  )
+```
+
+
+## Motif Analysis
+
+```{r setup-motif-analysis}
+motif_db <- here::here(all_paths$annotation, "motif_list.rds") %>% 
+  read_rds() %>% 
+  to_df() %>% 
+  as_tibble()
+motif_uri <- here::here(all_paths$annotation, "motif_uri.rds") %>% 
+  read_rds()
+fw_seq <- combined_results %>%
+  # subset(grepl("(In|De)creased", status)) %>% 
+  mutate(status = fct_rev(status)) %>% 
+  colToRanges("centre") %>% 
+  set_genome_info(ucsc$build) %>% 
+  resize(width = motif_params$peak_width, fix = 'center') %>% 
+  splitAsList(.$status) %>% 
+  .[map_int(., length) > 0] %>% 
+  mclapply(\(x) getSeq(bs_genome, x), mc.cores = threads) %>% 
+  lapply(\(x) x[letterFrequency(x, "N")[,1] == 0]) %>% 
+  setNames(pw_relabel(names(.))) 
+motif_enrich_res <- params$motif_enrichment %>%
+  here::here() %>%
+  read_tsv() %>%
+  dplyr::rename(adj_p = fdr) %>% 
+  mutate(adj_p = p.adjust(p, motif_params$adj), .by = comparison) %>% 
+  mutate(comparison = pw_relabel(comparison))
+motif_pos_res <- params$motif_position %>% 
+  here::here() %>%
+  read_tsv() %>%
+  dplyr::rename(adj_p = fdr) %>% 
+  mutate(adj_p = p.adjust(p, motif_params$adj), .by = comparison) %>% 
+  mutate(comparison = pw_relabel(comparison)) 
+any_motif_enrich <- any(motif_enrich_res$adj_p < motif_params$alpha)
+any_motif_pos <-  any(motif_pos_res$adj_p < motif_params$alpha)
+```
+
+Motif enrichment analysis was performed on each subset of sites within each group.
+An enrichment analysis was first performed comparing the loci within each group to the loci in all other groups, using a one-sided hypergeometric test, noting that if few sites, or nearly all sites are changed, results may of minor interest.
+
+A second test was subsequently performed testing for any positional bias of motifs within the set of changed sites, with no requirement for any background set of sequences.
+This test will identify any motifs which are centrally located, or have any other type of positional bias within the set of changed sites.
+
+In all sections below, only significant results are returned.
+
+### Motif Enrichment 
+
+`r ifelse(any_motif_enrich, "#### Result Tables {.tabset}", "*No groups were found to be enriched for any of the tested motifs.*")`
+
+
+```{r test-combined-tbl, echo = FALSE, eval = FALSE}
+# tbl_id <- "motif-enrich-tbl"
+# tbl <- motif_enrich_res %>% 
+#   dplyr::filter(adj_p < motif_params$alpha) %>% 
+#   mutate(
+#     across(ends_with("name"), as.factor),
+#     cluster = as.factor(cluster)
+#   ) %>% 
+#   reactable(
+#     showPageSizeOptions = nrow(.) > 10,
+#     filterable = TRUE, groupBy = "cluster", searchable = TRUE,
+#     columns = c(
+#       motif_cols[names(motif_cols) %in% colnames(.)] %>% 
+#         .[setdiff(names(.), c("altname", "name"))],
+#       list(
+#         altname = colDef(
+#           "Motif", minWidth = 180, aggregate = "unique",
+#           style = list(borderLeft = "1px solid rgba(0, 0, 0, 0.1)"),
+#           filterInput = \(values, name) drop_filter(values, name, tbl_id)
+#         ),
+#         sequences = colDef(show = FALSE),
+#         name = colDef(
+#           "Name", minWidth = 120, aggregate = "unique",
+#           style = list(borderRight = "1px solid rgba(0, 0, 0, 0.1)"),
+#           filterInput = \(values, name) drop_filter(values, name, tbl_id)
+#         ),
+#         comparison = colDef(
+#           "Comparison", minWidth = 100, aggregate = "unique",
+#           filterInput = \(values, name) drop_filter(values, name, tbl_id)
+#         )
+#       )
+#     ),
+#     defaultSorted = "adj_p", defaultSortOrder = "asc",
+#     theme = reactableTheme(style = list(fontSize = 12)),
+#     elementId = tbl_id
+#   )
+# tl <- tagList(
+#   tags$button(
+#     tagList(fontawesome::fa("download"), "Download as CSV"),
+#     onclick = glue(
+#       "Reactable.downloadDataCSV('{tbl_id}',",
+#       "'{params$full_comp}-motif_enrich_res.csv')"
+#     )
+#   ),
+#   tags$button(
+#     "Expand/Collapse All",
+#     onclick = glue("Reactable.toggleAllRowsExpanded('{tbl_id}')")
+#   ),
+#   tags$button(
+#     "Clear All Filters", onclick = glue("Reactable.setAllFilters('{tbl_id}', [])")
+#   ),
+#   tbl
+# )
+# if (interactive()) {
+#   browsable(tl)
+# } else {
+#   tl
+# }
+```
+
+
+
+```{r motif-enrich-tables}
+tagList(
+  motif_enrich_res %>% 
+    dplyr::filter(adj_p < motif_params$alpha) %>%
+    droplevels() %>% 
+    split(.$comparison) %>% 
+    mclapply(
+      \(x) {
+        nm <- unique(x$comparison)
+        n_seq <- unique(x$sequences)
+        pre <- nm %>% 
+          str_replace_all(" - ", "-") %>% 
+          str_replace_all(" ", "-") %>% 
+          str_to_lower() 
+        id <- paste0(pre, "-motif-enrich-table")
+        tbl <- x %>% 
+          dplyr::select(-all_of(c("comparison", "sequences"))) %>% 
+          mutate(
+            PWM = lapply(altname, \(x) motif_uri[[x]])
+          ) %>% 
+          reactable(
+            showPageSizeOptions = nrow(.) > 10,
+            filterable = TRUE, groupBy = "cluster",
+            columns = motif_cols[names(motif_cols) %in% colnames(.)],
+            defaultSorted = "adj_p", defaultSortOrder = "asc",
+            theme = reactableTheme(style = list(fontSize = 12)),
+            elementId = id
+          )
+        cp <- htmltools::em(
+          glue(
+            "Motif enrichment results when comparing all 
+            {comma(length(fw_seq[[nm]]))} sites considered as ", 
+            "'{nm}' to the sites from all other groups, using a one-sided ", 
+            "hypergeometric test to determine enrichment. ", 
+            "A total of {comma(n_seq)} sequences were tested within this group. ",
+            "Motifs were considered as enriched using an adjusted p-value ",
+            "(method = {motif_params$adj}) < {motif_params$alpha} as the sole ", 
+            "criteria. Motifs are grouped by the clusters formed during setup, ", 
+            "with all motifs able to be made visible by clicking the arrow ", 
+            "next to the arbitrary cluster identifier in the first column. ", 
+            "All columns are searchable and filterable."
+          )
+        )
+        tl <- tagList(
+          tags$button(
+            tagList(fontawesome::fa("download"), "Download as CSV"),
+            onclick = glue(
+              "Reactable.downloadDataCSV('{id}',",
+              "'{params$full_comp}-{pre}_motif_enrich_res.csv')"
+            )
+          ),
+          tags$button(
+            "Expand/Collapse All",
+            onclick = glue("Reactable.toggleAllRowsExpanded('{id}')")
+          ),
+          tags$button(
+            "Clear All Filters", onclick = glue("Reactable.setAllFilters('{id}', [])")
+          ),
+          tags$br(), tags$caption(cp), tbl
+        )
+        htmltools::div(
+          id = id, class = "section level5", htmltools::h5(nm), tl
+        )
+      }, mc.cores = threads
+    ) 
+)
+```
+
+`r if (any_motif_enrich) "#### Motif Co-Ocurrence {.tabset}"`
+
+```{r motif-corrplot, echo = any_motif_enrich}
+if (any_motif_enrich) {
+  motif_corplot <- motif_enrich_res %>% 
+    dplyr::filter(adj_p < motif_params$alpha) %>%
+    droplevels() %>% 
+    split(.$comparison) %>% 
+    .[map_int(., nrow) > 1] %>% 
+    lapply(
+      \(x) {
+        comp <- unique(x$comparison)
+        top_enrich <- x %>%
+          dplyr::filter(enrichment > 1, adj_p < motif_params$alpha) %>% 
+          dplyr::slice(1:20) %>% 
+          pull("altname")
+        mat <- motif_db %>% 
+          dplyr::filter(altname %in% top_enrich) %>% 
+          to_list() %>% 
+          getPwmMatches(
+            fw_seq[[comp]], min_score = motif_params$min_score, 
+            mc.cores = threads
+          ) %>% 
+          lapply(\(x) tibble(seq = unique(x$seq))) %>% 
+          bind_rows(.id = "name") %>%
+          distinct(name, seq) %>% 
+          left_join(dplyr::select(x, name), by = "name") %>% 
+          mutate(detected = TRUE) %>% 
+          pivot_wider(
+            names_from = "name", values_from = "detected", values_fill = FALSE
+          ) %>% 
+          dplyr::select(-seq) %>% 
+          dplyr::select(where(\(x) mean(x) < 1 & mean(x) > 0)) %>%
+          as.matrix()
+        if (length(diag(mat)) > 1) {
+          cor_mat <- cor(mat, method = "spearman")
+          hc <- hclust(dist(1 - cor_mat), method = "ward.D2")
+          dend <- ggdendro::dendro_data(as.dendrogram(hc))
+          levels <- dend$labels$label
+          ym <- max(dend$segments$xend)
+          dend_aes <- aes(yend, xend, xend = y, yend = x)
+          dend_plot <- ggplot(dend$segments) +
+            geom_segment(dend_aes) + 
+            scale_x_reverse(expand = expansion(0)) + 
+            scale_y_reverse(limits = c(ym, 0) + 0.5, expand = expansion(0)) +
+            labs(x = "", y = c()) + 
+            theme_minimal() + 
+            theme(
+              panel.grid = element_blank(), 
+              axis.text = element_blank(), axis.ticks = element_blank(), 
+              plot.margin = unit(c(5.5, 0, 5.5, 5.5), "points")
+            )
+          p <- cor_mat %>% 
+            as_tibble(rownames = "m1") %>% 
+            pivot_longer(cols = all_of(.$m1), names_to = "m2", values_to = "cor") %>% 
+            mutate(across(starts_with("m"), \(x) factor(x, levels = levels))) %>% 
+            dplyr::filter(m1 != m2) %>% 
+            ggplot(aes(m1, fct_rev(m2))) +
+            geom_point(aes(size = abs(cor), colour = cor, alpha = abs(cor))) +
+            geom_text(
+              aes(label = round(cor*100, 0), alpha = abs(cor)), show.legend = FALSE
+            ) +
+            scale_size(range = c(0, 10), guide = "none") +
+            scale_alpha(range = c(0, 1), guide = "none") +
+            scale_colour_gradient2(
+              low = direction_colours[["Decreased"]], 
+              high = direction_colours[["Increased"]],
+              limits = c(-1, 1), labels = percent_format(suffix = "")
+            ) +
+            scale_x_discrete(position = "top") +
+            labs(x = NULL, y = NULL, colour = expr(paste(rho))) +
+            theme(
+              panel.grid = element_blank(), 
+              axis.text.x.top = element_text(angle = 90, hjust = 0, vjust = 0.5)
+            )
+          dend_plot + p + plot_layout(widths = c(0.1, 0.9), axes = "collect")
+        } else {
+          NULL
+        }
+      }
+    )
+  motif_corplot <- motif_corplot[!map_lgl(motif_corplot, is.null)]
+}  
+```
+
+```{r show-motif-corplot, echo = FALSE}
+if (any_motif_enrich) {
+  tagList(
+    names(motif_corplot) %>% 
+      lapply(
+        \(x) {
+          ## Export the image
+          id <- x %>% 
+            str_replace_all(" - ", "-") %>% 
+            str_replace_all(" ", "-") %>% 
+            str_to_lower() %>% 
+            paste0("-motif-correlation")
+          img_out <- file.path(fig_path, paste0(id, ".", fig_type))
+          fig_fun(filename = img_out, width = fw, height = fh)
+          print(motif_corplot[[x]])
+          dev.off()
+          
+          ## Create html tags
+          fig_link <- str_extract(img_out, "assets.+")
+          cp <- htmltools::tags$caption(
+            htmltools::tags$em(
+              glue(
+                "The top 20 motifs ranked for enrichment in the group '{x}', ", 
+                "were compared to each other using correlations derived from ", 
+                "simple presence/absence calls. ", 
+                "Highly correlated motifs may indicate similarity between ", 
+                "TFBMs and the same sequence match being identified, or may ", 
+                "indicate motifs which co-occur. ",
+                "Motifs detected in all sequences were excluded after the ", 
+                "initial selction and as such, fewer than the selected 20 ", 
+                "motifs may be shown."
+              )
+            )
+          )
+          htmltools::div(
+            id = id, class = "section level5", htmltools::h5(x),
+            htmltools::div(
+              class = "figure", style = "text-align: center",
+              htmltools::img(src = fig_link, width = 960),
+              htmltools::div(class = "figure-caption", tags$caption(cp))
+            )
+          )
+        }
+    )
+  )
+}
+```
+
+
+`r if (any_motif_enrich) "#### Motif Enrichment Summary"`
+
+```{r motif-summary-plot, echo=any_motif_enrich, fig.height = 0.5 * fh,fig.cap = glue("*Summary of enrichment patterns for the {show_n} motifs considered to be enriched within at least one set of sequences. Tile colour indicates the odds ratio as a measure of enrichment, when comparing against all other groups of sequences combined. Significance is indicated by an asterisk, noting that all testing was one-sided, for enrichment only. Tile sizes represent the rate of motif matches occuring within each set of sequences, with small tiles commonly indicating rare motifs that may still have been considered to be enriched.*")}
+show_n <- 40
+if (any_motif_enrich) {
+  motif_enrich_mat <- motif_enrich_res %>% 
+    dplyr::filter(!str_detect(comparison, "Un.+Un")) %>% 
+    arrange(p) %>% 
+    dplyr::filter(all(is.finite(odds_ratio)), .by = altname) %>% 
+    dplyr::filter(altname %in% unique(altname)[seq_len(show_n)]) %>% 
+    dplyr::filter(any(adj_p < motif_params$alpha), .by = altname) %>% 
+    dplyr::filter(any(adj_p < motif_params$alpha), .by = comparison) %>% 
+    droplevels() %>% 
+    pivot_wider(
+      names_from = "name", values_from = "odds_ratio", id_cols = 'comparison'
+    ) %>% 
+    as.data.frame() %>% 
+    column_to_rownames("comparison") %>% 
+    as.matrix()
+  motif_dend <- dist(1 - cor(motif_enrich_mat)) %>% 
+    hclust() %>% 
+    as.dendrogram() %>% 
+    ggdendro::dendro_data()
+  motif_levels <- motif_dend$labels$label
+  motif_dend_plot <- ggplot(motif_dend$segments) +
+    geom_segment(aes(xend, y, xend = x, yend = yend)) + 
+    scale_x_continuous(
+      limits = range(motif_dend$segments$xend),
+      expand = expansion(0, 0.5)
+    ) +
+    scale_y_reverse(expand = rep_len(0, 4)) +
+    labs(x = "", y = c()) + 
+    theme_minimal() + 
+    theme(
+      panel.grid = element_blank(), 
+      axis.text = element_blank(), axis.ticks = element_blank(), 
+      plot.margin = unit(c(0, 5.5, 0, 5.5), "points")
+    )
+  comp_dend <- dist(1 - cor(t(motif_enrich_mat))) %>% 
+    hclust() %>% 
+    as.dendrogram() %>% 
+    ggdendro::dendro_data()
+  comp_levels <- comp_dend$labels$label
+  comp_dend_plot <- ggplot(comp_dend$segments) +
+    geom_segment(aes(yend, x, xend = y, yend = xend)) + 
+    scale_y_continuous(
+      limits = range(comp_dend$segments$xend), expand = expansion(0, 0.5)
+    ) +
+    scale_x_reverse(expand = expansion(c(0, 0))) +
+    labs(x = "", y = c()) + 
+    theme_minimal() + 
+    theme(
+      panel.grid = element_blank(), 
+      axis.text = element_blank(), axis.ticks = element_blank(), 
+      plot.margin = unit(c(5.5, 0, 5.5, 5.5), "points")
+    )
+  size_max <- max(motif_enrich_res$matches / motif_enrich_res$sequences)
+  main <- motif_enrich_res %>% 
+    dplyr::filter(
+      comparison %in% comp_dend$labels$label,
+      name %in% motif_dend$labels$label
+    ) %>% 
+    mutate(
+      name = factor(name, levels = motif_levels),
+      comparison = factor(comparison, levels = comp_levels),
+      rate = matches / sequences
+    ) %>% 
+    ggplot(aes(name, comparison)) +
+    geom_tile(
+      aes(fill = log2(odds_ratio), width = rate, height = rate)
+    ) +
+    geom_point(
+      data = . %>% dplyr::filter(adj_p < motif_params$alpha),
+      shape = 8, alpha = 0.7, size = 0.7
+    ) +
+    scale_fill_gradient2(
+      low = direction_colours[["Decreased"]],
+      high = direction_colours[["Increased"]], na.value = "white"
+    ) +
+    scale_x_discrete() +
+    scale_y_discrete(
+      labels = \(x) str_replace_all(x, " - ", "\n"),
+      expand = expansion(0)
+    ) +
+    labs(x = c(), y = c()) +
+    theme(
+      axis.text.x = element_text(angle = 90, hjust = 1, vjust = 0.5),
+      panel.grid = element_blank(),
+      plot.margin = unit(c(5.5, 5.5, 0, 0), "points")
+    ) 
+  comp_dend_plot + main + motif_dend_plot + 
+    plot_layout(
+      design = c(area(1, 1, 9, 1), area(1, 2, 9, 12), area(10, 2, 10, 12)),
+      axes = "collect"
+    )
+}
+```
+  
+### Motifs With Positional Bias
+
+`r ifelse(any_motif_pos, "#### Result Tables {.tabset}", "*No groups were found to show positional bias for any motifs.*")`
+
+```{r motif-pos-tables, echo = FALSE}
+if (any_motif_pos) {
+  tagList(
+    motif_pos_res %>% 
+      dplyr::filter(adj_p < motif_params$alpha) %>%
+      droplevels() %>% 
+      split(.$comparison) %>% 
+      lapply(
+        \(x) {
+          nm <- unique(x$comparison)
+          pre <- nm %>% 
+            str_replace_all(" - ", "-") %>% 
+            str_replace_all(" ", "-") %>% 
+            str_to_lower() 
+          id <- paste0(pre, "-motif-pos-table")
+          tbl <- x %>% 
+            dplyr::select(-all_of(c("comparison"))) %>% 
+            mutate(
+              PWM = lapply(altname, \(x) motif_uri[[x]])
+            ) %>% 
+            reactable(
+              showPageSizeOptions = nrow(.) > 10,
+              filterable = TRUE, groupBy = "cluster",
+              columns = motif_cols[names(motif_cols) %in% colnames(.)],
+              defaultSorted = "adj_p", defaultSortOrder = "asc",
+              theme = reactableTheme(style = list(fontSize = 12)),
+              elementId = id
+            )
+          cp <- htmltools::em(
+            glue(
+              "All {comma(nrow(x))} motifs showing positional bias within the ", 
+              "{comma(length(fw_seq[[nm]]))} sites considered as '{nm}'. ", 
+              "Significance was determined using an adjusted p-value (method = ", 
+              "{motif_params$adj}) < {motif_params$alpha}. ",
+              " Highly similar motifs were clustered during preparation and are ", 
+              "grouped accordingly. Clicking the arrow next to the arbitrary ", 
+              "cluster id will reveal full details for all motifs within the ", 
+              "cluster that were considered significant, ", 
+              "including the sequence logo showing information content (ICM)"
+            )
+          )
+          tl <- tagList(
+            tags$button(
+              tagList(fontawesome::fa("download"), "Download as CSV"),
+              onclick = glue(
+                "Reactable.downloadDataCSV('{id}',",
+                "'{params$full_comp}-{pre}_motif_pos_res.csv')"
+              )
+            ),
+            tags$button(
+              "Expand/Collapse All",
+              onclick = glue("Reactable.toggleAllRowsExpanded('{id}')")
+            ),
+            tags$button(
+              "Clear All Filters", onclick = glue("Reactable.setAllFilters('{id}', [])")
+            ),
+            tags$br(), tags$caption(cp), tbl
+          )
+          htmltools::div(
+            id = id, class = "section level5", htmltools::h5(nm), tl
+          )
+        }
+      ) 
+  )
+}
+```
+
+`r ifelse(any_motif_pos, "#### Positional Bias Plots {.tabset}", "")`
+
+```{r plot-motif-pos, echo=FALSE}
+if (any_motif_pos) {
+  tagList(
+    motif_pos_res %>% 
+      dplyr::filter(adj_p < motif_params$alpha) %>%
+      droplevels() %>% 
+      split(.$comparison) %>% 
+      lapply(
+        \(x) {
+          ## Make the figure
+          nm <- unique(x$comparison)
+          id <- nm %>% 
+            str_to_lower() %>% 
+            str_replace_all("[ -]+", "-") %>% 
+            paste0("-motif-pos")
+          seq <- fw_seq[[nm]]
+          motifs <- x %>% 
+            arrange(desc(enrichment)) %>% 
+            distinct(cluster, .keep_all = TRUE) %>% 
+            dplyr::slice(1:8) %>% 
+            pull("name")
+          matches <- motif_db %>% 
+            dplyr::filter(name %in% motifs) %>% 
+            to_list() %>% 
+            getPwmMatches(
+              seq, min_score = motif_params$min_score, 
+              best_only = TRUE, break_ties = motif_params$break_ties, 
+              mc.cores = threads
+            )
+          p <- matches[motifs] %>% 
+            plotMatchPos(
+            abs = motif_params$abs, binwidth = motif_params$binwidth, 
+            se = FALSE, linewidth = 1/2
+          ) +
+            scale_y_continuous(labels = percent) +
+            scale_colour_brewer(palette = "Set1") +
+            labs(
+              x = "Distance From Sequence Centre", y = "% Matches",
+              colour = "Representative Motif"
+            )
+          ## Export the file
+          img_out <- file.path(fig_path, paste0(id, ".", fig_type))
+          fig_fun(filename = img_out, width = fw, height = fh)
+          print(p)
+          dev.off()
+          
+          ## Prepare the caption
+          cp <- htmltools::em(
+            glue(
+            "
+            Taking all motifs considered to be showing positional bias within
+            the set of sequences associated with {nm} sites, the most highly 
+            ranked motif within each cluster was chosen as a representative motif.
+            The proportion of matches within each bin are shown for each 
+            representative motif, with total sequences given in the above tables.
+            "
+            )
+          )
+          
+          ## Setup the html link
+          fig_link <- str_extract(img_out, "assets.+")
+          htmltools::div(
+            id = id, class = "section level5", htmltools::h5(nm),
+            htmltools::div(
+              class = "figure", style = "text-align: center",
+              htmltools::img(src = fig_link, width = 960),
+              htmltools::div(class = "figure-caption", tags$caption(cp))
+            )
+          )
+          
+        }
+      )
+  )
+}
+```
+
+
+```{r add-rna, eval = length(rna) > 0, child = here::here('workflow/modules/_rna_pairwise.Rmd')}
+```
+
+## Data Export
+
+```{r define-outputs}
+out_path <- file.path("output", "results", "pairwise_comparisons", params$full_comp)
+if (!dir.exists(out_path)) dir.create(here::here(out_path), recursive = TRUE)
+all_out <- list(
+  results = file.path(out_path, glue(params$full_comp, "-pairwise_comparison.csv")),
+  enrichment = file.path(out_path, glue("{params$full_comp}-enrichment.csv")),
+  localz = file.path(out_path, glue("{params$full_comp}-localz.csv")),
+  renv = here::here(
+    "output", "envs", glue(params$full_comp, "-pairwise_comparison.RData")
+  )
+)
+```
+
+
+```{r data-export, results = 'hide'}
+combined_results %>% 
+  as_tibble() %>% 
+  write_csv(here::here(all_out$results))
+enrich_by_status %>% 
+  bind_rows(.id = "status") %>% 
+  write_csv(here::here(all_out$enrichment))
+localz_df %>% write_csv(here::here(all_out$localz))
+save.image(here::here(all_out$renv))
+```
+
+Existing results obtained during previous steps in the workflow and presented here are:
+
+`r pander(params[c("motif_enrichment", "motif_position")])`
+
+Full results generated here were also saved to:
+
+`r pander(all_out)`
+
+## References
+
+<div id="refs"></div>
+<br>
+
+<button type="button" class="btn btn-default btn-sessioninfo" data-toggle="collapse" data-target="#sessioninfo" style="display: block;">
+<span class="glyphicon glyphicon-info-sign" aria-hidden="true"></span> Session information
+</button>
+</p>
+<div id="sessioninfo" class="collapse">
+
+```{r session-info, echo=FALSE}
+pander::pander(sessionInfo())
+```
+
+</div>

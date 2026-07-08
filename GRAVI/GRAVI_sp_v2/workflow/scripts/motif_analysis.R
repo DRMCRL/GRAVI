@@ -1,0 +1,256 @@
+#' This script uses motifTestR to analyse motifs
+#'
+#' Required input files is:
+#' - output/peak_analysis/{target}/{target}_consensus_peaks.bed.gz
+#' - output/annotations/gene_regions.rds
+#' - output/annotations/motif_list.rds
+#' - output/annotations/exclude_ranges.rds
+#' - output/checks/here.chk
+#' - output/checks/r-packages.chk
+#'
+#' Expected output is:
+#' - output/peak_analysis/{target}/{target}_motif_enrichment.tsv.gz
+#' - output/peak_analysis/{target}/{target}_motif_position.tsv.gz
+#' - output/peak_analysis/{target}/{target}_matches.rds
+#'
+#' Required config parameters:
+#' - genome$build
+#'
+#' Required enrichment parameters may possibly be
+#' - n_iterations
+#' - model
+#' - peak_width
+#' - binwidth
+#'
+#' Testing will involve
+#' - Running `testMotifPos()` setting abs = TRUE. There's no real need to test symmetrically around zero
+#' - Running `testMotifEnrich()` using the negbinom model & 100 iterations
+#'
+#' Can results also be written to a tsv/html during this step, or should that wait?
+#'
+conda_pre <- system2("echo", "$CONDA_PREFIX", stdout = TRUE)
+if (conda_pre != "") {
+  conda_lib_path <- file.path(conda_pre, "lib", "R", "library")
+  if (!dir.exists(conda_lib_path)) conda_lib_path <- NULL
+  prev_paths <- .libPaths()
+  paths_to_set <- unique(c(conda_lib_path, prev_paths))
+  .libPaths(paths_to_set)
+}
+## A function for printing input
+cat_list <- function(x, slot = NULL, sep = "\n\t"){
+  nm <- setdiff(names(x), "")
+  invisible(
+    lapply(
+      nm,
+      \(i) cat("Received", slot, i, sep, paste0( x[[i]], "\n\t"), "\n")
+    )
+  )
+}
+cat_time <- function(...){
+  tm <- format(Sys.time(), "%Y-%b-%d %H:%M:%S\t")
+  cat(tm, ..., "\n")
+}
+
+
+
+# all_input <- list(
+#   here = "output/checks/here.chk",
+#   exclude_ranges = "output/annotations/exclude_ranges.rds",
+#   gene_regions = "output/annotations/gene_regions.rds",
+#   motifs = "output/annotations/motif_list.rds",
+#   n_masked_ranges = "output/annotations/n_masked_ranges.rds",
+#   packages = "output/checks/r-packages.chk",
+#   params = "config/params.yml",
+#   peaks = "output/peak_analysis/ER/ER_consensus_peaks.rds"
+# )
+# all_output <- list(
+#   enrich = "output/peak_analysis/ER/ER_motif_enrichment.tsv.gz",
+#   pos = "output/peak_analysis/ER/ER_motif_position.tsv.gz",
+#   matches = "output/peak_analysis/ER/ER_matches.rds"
+# )
+# all_params = list(
+#   motif_params = list(
+#       abs = TRUE,
+#       adj = "fdr", # not used here
+#       alpha = 0.05, # not used here
+#       binwidth = 10,
+#       break_ties = "all",
+#       peak_width = 400,
+#       ignore_below = 0.01,
+#       iterations = 100,
+#       min_score = "80%",
+#       model = "quasipoisson"
+#     )
+# )
+# config <- list(genome = list(build = "GRCh37"))
+# threads <- 4
+
+log <- slot(snakemake, "log")[[1]]
+message("Setting stdout to ", log, "\n")
+sink(log, split = TRUE)
+config <- slot(snakemake, "config")
+threads <- slot(snakemake, "threads")
+all_input <- slot(snakemake, "input")
+## diagnostic script
+cat("=== Snakemake inputs ===\n")
+for (i in seq_along(all_input)) {
+    cat(names(all_input)[i], ":", all_input[[i]], "\n")
+}
+cat("========================\n")
+# end of diagnostic script
+all_output <- slot(snakemake, "output")
+all_params <- slot(snakemake, "params")
+all_resources <- slot(snakemake, "resources")
+all_wildcards <- slot(snakemake, "wildcards")
+cat_list(all_input, "input", sep = ":")
+cat_list(all_output, "output", sep = ":")
+cat_list(all_wildcards, "wildcards", sep = ":")
+cat_list(all_params, "params")
+cat_list(all_resources, "resources", sep = ":")
+
+## Solidify file paths
+all_input <- lapply(all_input, here::here)
+all_output <- lapply(all_output, here::here)
+
+cat_time("Running with", threads, "threads")
+cat_time("Loading packages...")
+library(motifTestR)
+library(tidyverse)
+library(extraChIPs)
+library(yaml)
+library(scales)
+library(universalmotif)
+library(plyranges)
+
+motif_params <- all_params$motif_params
+
+## Contains the function for finding UCSC build info
+source(here::here("workflow/scripts/get_ucsc.R"))
+ucsc <- get_ucsc(config$genome$build)
+pkg <- paste(c("BSgenome", ucsc$sp, "UCSC", ucsc$build), collapse = ".")
+cat_time("Loading", pkg)
+library(pkg, character.only = TRUE)
+
+cat_time("Reading gene_regions")
+gene_regions <- read_rds(all_input$gene_regions)
+sq <- seqinfo(gene_regions)
+## Convert to the same as the BSgenome package
+genome(sq) <- ucsc$build
+seqinfo(gene_regions) <- sq
+
+cat_time("Reading Peaks...")
+peaks <- read_rds(all_input$peaks)
+if (!"centre" %in% colnames(mcols(peaks)))
+  peaks$centre <- floor(start(peaks) + 0.5 * width(peaks))
+genome(peaks) <- ucsc$build
+
+cat_time("Resizing and recentering peaks")
+peaks <- peaks |>
+  mutate(centre = paste0(seqnames, ":", centre)) |>
+  colToRanges("centre", seqinfo = sq) |>
+  resize(width = motif_params$peak_width, fix = "center")
+## Recentering may have moved some of these
+cat_time("Remapping peaks to regions")
+peaks$region <- bestOverlap(peaks, gene_regions)
+cat_time("Read", comma(length(peaks)), "peaks")
+
+cat_time("Getting peak sequences...")
+bs_genome <- get(pkg)
+test_seq <- getSeq(bs_genome, peaks)
+names(test_seq) <- as.character(peaks)
+n_seq <- length(test_seq)
+cat_time("done")
+
+cat_time("Removing sequences with Ns")
+has_n <- letterFrequency(test_seq, "N")[,1] > 0
+test_seq <- test_seq[!has_n]
+peaks <- peaks[!has_n]
+cat_time("Found", sum(has_n), "sequences with Ns")
+
+motif_list <- read_rds(all_input$motifs)
+cat_time("Checking for low frequency matches")
+min_matches <- motif_params$ignore_below * n_seq
+counts <- countPwmMatches(
+  motif_list, test_seq, min_score = motif_params$min_score,
+  mc.cores = threads
+)
+ignore <- counts < min_matches
+cat_time(
+  "Found", sum(ignore), "motifs with matches in <",
+  percent(motif_params$ignore_below), "of sequences"
+)
+
+cat_time("Started getting best matches")
+matches <- getPwmMatches(
+  motif_list[!ignore], test_seq, best_only = TRUE,
+  min_score = motif_params$min_score, break_ties = motif_params$break_ties,
+  mc.cores = threads
+)
+cat_time("done")
+gc()
+
+cat_time("Testing for Positional Bias")
+pos_res <- testMotifPos(
+  matches, binwidth = motif_params$binwidth, abs = motif_params$abs,
+  min_score = motif_params$min_score,  mc.cores = threads
+)
+cat_time("done\n")
+gc()
+
+cat_time("Writing", all_output$pos)
+pos_res |>
+  as_tibble(rownames = "name") |>
+  left_join(to_df(motif_list), by = "name") |>
+  dplyr::select(ends_with("name"), cluster, all_of(colnames(pos_res))) |>
+  dplyr::select(-contains("consensus")) |>
+  write_tsv(all_output$pos)
+
+cat_time("Defining ranges to exclude when selecting control sequences")
+exclude_ranges <- read_rds(all_input$exclude_ranges)
+n_mask <- read_rds(all_input$n_masked_ranges)
+genome(n_mask) <- genome(exclude_ranges)
+exclude_ranges <- c(exclude_ranges, n_mask) |>
+  GenomicRanges::reduce() |>
+  sort()
+
+
+cat_time("Generating RMRanges based on provided gene_regions")
+rm_ranges <- makeRMRanges(
+  splitAsList(peaks, peaks$region), gene_regions, exclude = exclude_ranges,
+  n_iter = motif_params$iterations, mc.cores = threads
+)
+cat_time("Sampled", comma(length(rm_ranges)), "RMRanges\n")
+gc()
+
+cat_time("Extracting RMSeq")
+rm_seq <- getSeq(bs_genome, rm_ranges)
+mcols(rm_seq) <- mcols(rm_ranges)
+cat_time("done")
+
+cat_time("Testing for motif enrichment")
+enrich_res <- testMotifEnrich(
+  motif_list, test_seq, rm_seq, model = motif_params$model,
+  min_score = motif_params$min_score, mc.cores = threads
+)
+cat_time("Done")
+
+cat_time("Writing", all_output$enrich)
+enrich_res |>
+  as_tibble(rownames = "name") |>
+  left_join(to_df(motif_list), by = "name") |>
+  dplyr::select(ends_with("name"), cluster, all_of(colnames(enrich_res))) |>
+  dplyr::select(-contains("consensus")) |>
+  write_tsv(all_output$enrich)
+cat_time("Done")
+
+## Sets of matches can exceed 2GB which makes loading during the signal_summary
+## compilation very difficult. Best to manually find the matches for just the
+## top motifs within the document itself
+# all_sig <- c(
+#   rownames(subset(pos_res, fdr < params$alpha)),
+#   rownames(subset(enrich_res, fdr < params$alpha))
+# ) |>
+#   unique()
+# cat_time("Exporting all", length(all_sig), "matches for significant TFBMs")
+# write_rds(matches[all_sig], all_output$matches, compress = "gz")
+# cat_time("Done")

@@ -1,0 +1,5 @@
+sample	target	treat	input	passage
+ATAC_PMSG1	ATAC	PMSG	GR_input	1
+ATAC_PMSG2	ATAC	PMSG	GR_input	2
+ATAC_hCG1	ATAC	hCG	GR_input	1
+ATAC_hCG2	ATAC	hCG	GR_input	2

@@ -1,0 +1,94 @@
+## Please see https://smped.github.io/GRAVI/editing-yaml.html for a description of this file
+samples:
+  file: "config/sample.txt"
+
+paths:
+  bam: "data/bam"
+
+## Used to obtain data from Gencode & also the blacklists
+genome:
+  build: "GRCm38"
+  gencode: "M25"
+
+## External files
+external:
+  blacklist:
+  features:
+  gtf:
+  hic:
+  motifdb:
+  rna:
+
+## Both macs2 fields are now updated so there is a default
+## This is passed to all targets, however, if a different value is required
+## in any field for a specific target, then adding that field for the given
+## target can be done, e.g. AR: fdr: 0.01 (in the correct YAML format)
+peak_calling:
+  default:
+    ## Passed to macs2
+    gsize: "mm"
+    fdr: 0.0000000001 #1e-7 or 10 for ATAC, ~ to pval 1e-9 historically used for ChIP
+    merge_fdr: 0.05 # Thao added this since snakemake complains this was missing
+    keep_duplicates: "all"
+    macs2_extra: "" 
+    peak_type: "narrow" ## **Currently ignored** ##
+    ## Used during creation of consensus peaks
+    merge_within: 0 
+    min_width: 0
+    min_prop_reps: 0.5
+    ## QC params
+    allow_zero: false
+    outlier_threshold: 10
+
+
+## Name any targets here which should have these additional modules run
+modules:
+  nfr: "ATAC"
+
+## 'shared' and 'nfr' can aso be added here in addition to any targets
+motif_analysis:
+  default:
+    abs: true
+    adj: "fdr"
+    alpha: 0.05
+    binwidth: 10
+    break_ties: "all"
+    # Motifs found in fewer sequences won't be tested for positional bias
+    ignore_below: 0.01
+    iterations: 100
+    model: "quasipoisson"
+    min_score: "80%"
+    peak_width: 400
+
+## Set the defaults across all targets here and set any changes as desired
+## for any specific target
+differential_signal:
+  default:
+    alpha: 0.05
+    contrasts:
+      - ["PMSG", "hCG"]
+    ihw: "regions"
+    fc: 1
+    filter_q:
+    method: "qlf"
+    min_win: 1
+    nesting:
+    norm: "TMM"
+    window_type: "fixed"
+    window_size: 400
+    window_step:
+
+profile_heatmaps:
+  default:
+    bw_type: "coverage" # Can be FE or coverage
+    gradient: ['white', 'red']
+    min_ranges: 10
+    max_ranges: 5000
+    n_bins: 100
+    width: 1000
+
+
+pairwise:
+  default:
+    alpha: 0.05
+    width_ratio: 2
