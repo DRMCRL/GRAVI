@@ -12,10 +12,10 @@ genome:
 
 ## External files
 external:
-  blacklist:
-  features:
-  gtf:
-  hic:
+  blacklist: "data/external/Merged_hg19_blacklist_3col.bed" 
+  features: 
+  gtf: "data/external/gencode.v19.annotation.gtf.gz"
+  hic: "data/external/encode_hic.bedpe"
   motifdb:
   rna:
 
@@ -32,6 +32,7 @@ peak_calling:
     macs2_extra: "" 
     peak_type: "narrow" ## **Currently ignored** ##
     ## Used during creation of consensus peaks
+    merge_fdr: 0.05
     merge_within: 0 
     min_width: 0
     min_prop_reps: 0.5
