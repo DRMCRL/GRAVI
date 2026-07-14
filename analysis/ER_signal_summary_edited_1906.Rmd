@@ -1,0 +1,2281 @@
+---
+title: 'ER: Summary of Detected Signal'
+date: "`r format(Sys.Date(), '%d %B, %Y')`"
+bibliography: references.bib
+link-citations: true
+params:
+  target: "ER"
+---
+
+```{r set-knitr-opts, echo=FALSE, child = here::here('analysis/setup_chunk.Rmd')}
+```
+
+
+```{r get-params}
+target <- params$target
+threads <- parallel::detectCores() - 1
+```
+
+
+```{r packages}
+library(tidyverse)
+library(magrittr)
+library(rtracklayer)
+library(glue)
+library(pander)
+library(scales)
+library(plyranges)
+library(yaml)
+library(ngsReports)
+library(SimpleUpset)
+library(VennDiagram)
+library(rlang)
+library(BiocParallel)
+library(parallel)
+library(Rsamtools)
+library(Biostrings)
+library(ggside)
+library(extraChIPs)
+library(patchwork)
+library(reactable)
+library(htmltools)
+library(rGREAT)
+library(ggraph)
+library(tidygraph)
+library(patchwork)
+library(msigdbr)
+library(regioneReloaded)
+library(universalmotif)
+library(motifTestR)
+library(fontawesome)
+library(GenomicInteractions)
+panderOptions("big.mark", ",")
+panderOptions("missing", "")
+panderOptions("table.split.table", Inf)
+theme_set(
+  theme_bw() +
+    theme(plot.title = element_text(hjust = 0.5))
+)
+register(MulticoreParam(workers = threads))
+source(here::here("scripts", "custom_functions.R"))
+config <- read_yaml(here::here("config", "config.yml"))
+#config <- read_yaml("config/config.yml")
+all_paths <- here::here("config", "json", "all_paths.json") %>% 
+    jsonlite::fromJSON() %>% 
+    lapply(here::here)
+# all_paths <- list(
+#   annotation  = here::here("output/annotations"),
+#   bam         = here::here("data/bam"),
+#   diff_signal = here::here("output/differential_signal"),
+#   greylist    = here::here("output/greylist"),
+#   json        = here::here("config/json"),
+#   macs2       = here::here("output/macs2"),
+#   nfr         = here::here("output/nfr"),
+#   peaks       = here::here("output/peak_analysis"),
+#   rmd         = here::here("analysis")
+# )
+ucsc <- get_ucsc(config$genome$build)
+bs_pkg <- glue("BSgenome.{ucsc$sp}.UCSC.{ucsc$build}")
+library(bs_pkg, character.only = TRUE)
+```
+
+```{r config-params-paths}
+all_params <-  here::here("config", "params.yml") %>% read_yaml() 
+enrich_params <- all_params$enrichment
+mapping_params <- all_params$mapping
+msigdb_params <- all_params$msigdb
+network_params <- all_params$networks
+region_params <- all_params$gene_regions
+regioner_params <- all_params$regioner
+motif_params <- here::here("config", "json", "motif_analysis_param.json") %>%
+  jsonlite::fromJSON() %>%
+  pluck(target)
+peak_calling_params <- here::here("config", "json", "peak_calling_param.json") %>%
+  jsonlite::fromJSON() %>%
+  pluck(target)
+knitr_params <- here::here("config", "rmarkdown.yml") %>% 
+  read_yaml() %>% 
+  pluck("knitr_opts")
+source(here::here("scripts", "table_funs.R"))
+source(here::here("scripts", "enrichment_funs.R"))
+```
+
+```{r read-samples}
+samples <- all_paths$macs2 %>%
+  file.path(target, glue("{target}_qc_samples.tsv")) %>%
+  read_tsv()
+treat_levels <- unique(samples$treat)
+sample2label <- setNames(samples$label, samples$sample)
+if (!is.null(config$comparisons$contrasts)) {
+  ## Ensure levels respect those provided in contrasts
+  treat_levels <- config$comparisons$contrasts %>%
+    unlist() %>%
+    intersect(samples$treat) %>% 
+    unique()
+}
+rep_col <- setdiff(
+  colnames(samples), c("sample", "treat", "target", "input", "label", "qc")
+)
+samples <- samples %>%
+  mutate(
+    treat = factor(treat, levels = treat_levels)
+  ) %>% 
+  dplyr::filter(treat %in% treat_levels)
+stopifnot(nrow(samples) > 0)
+ip <- unique(samples$input)
+```
+
+```{r set-colours}
+## Set the colour palettes
+colours <- file.path(all_paths$annotation, "colours.rds") %>% 
+  read_rds() %>% 
+  lapply(unlist)
+colours$direction <- c(
+  colours$direction, 
+  c(up = colours$direction[["increased"]], down = colours$direction[["decreased"]])
+)
+full_palette <- colours %>% 
+  .[setdiff(names(.), "heatmaps")] %>% 
+  unname() %>% 
+  unlist()
+```
+
+
+```{r load-annotations}
+## Seqinfo
+sq <- read_rds(file.path(all_paths$annotation, "seqinfo.rds"))
+## Gene Annotations
+gtf <- read_rds(file.path(all_paths$annotation, "gtf.rds"))
+tss <- read_rds(file.path(all_paths$annotation, "tss.rds"))
+## Gene Regions
+gene_regions <- read_rds(file.path(all_paths$annotation, "gene_regions.rds"))
+regions <- vapply(gene_regions, function(x) unique(x$region), character(1))
+## External features
+features <- read_rds(file.path(all_paths$annotation, "features.rds"))
+has_features <- length(features) > 0
+feat_names <- names(features) %>% 
+  lapply(
+    \(x) paste(x, features[[x]]$feature, sep = ": ")
+  ) %>% 
+  lapply(fct_infreq) %>% 
+  lapply(levels) %>% 
+  unlist()
+## Combine features & regions for testing
+all_regions <- c(unname(regions), feat_names)
+region_colours <- c(colours$regions, colours$features) %>%
+  setNames(
+    case_when(
+      names(.) %in% names(regions) ~ regions[names(.)],
+      TRUE ~ names(.)
+    )
+  )
+rna <- read_rds(file.path(all_paths$annotation, "rna.rds"))
+has_rna <- length(rna) > 0
+hic <- read_rds(file.path(all_paths$annotation, "hic.rds"))
+```
+
+```{r figure-params}
+fh <- knitr_params$fig.height
+fw <- knitr_params$fig.width
+fig_path <- here::here("docs", "assets", target)
+if (!dir.exists(fig_path)) dir.create(fig_path, recursive = TRUE)
+fig_type <- knitr_params$dev[[1]]
+fig_fun <- match.fun(fig_type)
+if (fig_type %in% c("bmp", "jpeg", "png", "tiff")) {
+  ## These figure types require dpi & resetting to be inches
+  formals(fig_fun)$units <- "in"
+  formals(fig_fun)$res <- 300
+}
+```
+
+
+```{r bfl}
+bfl <- all_paths$bam %>%
+  file.path(glue("{samples$sample}.bam")) %>%
+  BamFileList() %>%
+  setNames(samples$sample)
+```
+
+```{r load-peaks}
+individual_peaks <- file.path(
+  all_paths$macs2, samples$sample, glue("{samples$sample}_peaks.narrowPeak")
+) %>%
+  importPeaks(seqinfo = sq) %>%
+  endoapply(names_to_column, var = "sample") %>% 
+  endoapply(mutate, sample = str_remove(sample, "_peak_[0-9]+$")) %>% 
+  endoapply(
+    mutate, 
+    treat = left_join(tibble(sample = sample), samples, by = "sample")$treat
+  ) %>% 
+  setNames(samples$sample)
+merged_peaks <- all_paths$macs2 %>% 
+  file.path(target, glue("{target}_{treat_levels}_merged_peaks.narrowPeak")) %>% 
+  importPeaks(seqinfo = sq) %>% 
+  setNames(treat_levels)
+filtered_peaks <- all_paths$peaks %>% 
+  file.path("{target}", "{target}_{treat_levels}_filtered_peaks.narrowPeak") %>% 
+  glue() %>% 
+  importPeaks(seqinfo = sq) %>% 
+  setNames(treat_levels)
+consensus_peaks <- all_paths$peaks %>% 
+  file.path("{target}", "{target}_consensus_peaks.rds") %>% 
+  glue() %>% 
+  read_rds() 
+```
+
+
+```{r macs2-logs}
+macs2_logs <- all_paths$macs2 %>%
+  file.path(samples$sample, glue("{samples$sample}_callpeak.log")  ) %>%
+  importNgsLogs() %>%
+  dplyr::select(
+    -contains("file"), -outputs, -n_reads, -alt_fragment_length
+  ) %>%
+  left_join(samples, by = c("name" = "sample")) %>%
+  mutate(
+    total_peaks = map_int(
+      name, function(x) length(individual_peaks[[x]])
+    )
+  ) 
+```
+
+## Outline
+
+The strategy for identification of genomic regions with detectable `r target` signal (i.e. peaks), was to run `macs2 callpeak` [@Zhang18798982] on each individual sample, as well as on all samples within each treatment group (`r pander(treat_levels)`).
+The settings for `macs2 callpeak` were:
+
+`r pander(peak_calling_params[c("gsize", "fdr", "keep_duplicates", "macs2_extra", "peak_type")])`
+
+Additional QC and peak merging settings included:
+
+`r pander(peak_calling_params[c("merge_fdr", "merge_within", "min_prop_reps", "outlier_threshold", "allow_zero")])`
+
+Bedgraph files were produced for each sample to return values scaled using the `--SPMR` flag, as signal per million reads, which is analogous to the common Counts Per Million (CPM) value.
+Where required, these were converted to BigWig files in order to save storage space & speed up analysis.
+
+### Identification of Peaks and QC Description
+
+#### Individual Sample QC settings
+
+For individual samples, any sample with > `r peak_calling_params$outlier_threshold`x the median number of peaks found across all samples within that treatment group would be marked as failing QC and excluded from further analysis.
+Any samples with no detected peaks would also be `r ifelse(peak_calling_params$allow_zero, 'retained, to account for any cytoplasmic-nuclear shift in response to treatment', 'excluded')`.
+
+#### Filtered Peaks
+
+A set of *treatment-specific* filtered peaks was defined for each treatment group, based on the peaks identified when running `macs2 callpeak` on all samples within a treatment group.
+Any peak which was not found in >`r percent(peak_calling_params$min_prop_reps)` of *individual samples* within that treatment group was then discarded.
+Peaks within `r peak_calling_params$merge_within`bp of each other were merged into a single peak.
+Peaks detected within merged samples were only retained with an FDR < `r peak_calling_params$merge_fdr`
+
+Peaks which overlapped any blacklisted or grey-listed regions were discarded.
+
+#### Consensus Peaks
+
+Consensus peaks across all treatment groups were then produced by combining all sets of filtered (i.e. *treatment-specific*) peaks.
+These peaks were defined as the union of all peaks across all treatment groups.
+Overlapping peaks between treatment groups were merged to create a peak encompassing the range identified in all treatment groups.
+
+### Additional Analysis
+
+After identification of peaks
+
+- A selection of highly-ranked peaks were plotted
+- The relationship to detected genes within any transcriptomic data was assessed
+- Enrichment of binding sites within gene-sets was assessed
+- The relationship of binding sites to genomic regions and any features was assessed
+- Motif analysis was performed, checking for general motif enrichment as well as any association between motifs and peak centres (i.e. positional bias)
+
+## QC {.tabset}
+
+This section provides a simple series of visualisations to enable detection of any problematic samples.
+
+- Library Sizes: These are the total number of alignments contained in each `bam` file, as passed to `macs2 callpeak`
+- GC Content: Most variation in GC-content should have been identified prior to performing alignments, using common tools such as [FastQC](https://github.com/s-andrews/FastQC), MultiQC [@EwelsMultiQC2016] or `ngsReports` [@WardNgsReports2019]. However, these plots may still be informative for detection of potential sequencing issues not previously addressed
+- Peaks Detected: The number of peaks detected within each individual replicate are shown here, and provide clear guidance towards any samples where the IP may have been less successful, or there may be possible sample mis-labelling. Using the settings provided in `config.yml` (i.e. `peak_qc:outlier_threshold`), any replicates where the number of peaks falls outside the range defined by $\pm$ `r peak_calling_params$outlier_threshold`-fold of the median peak number within each treatment group **will be marked as failing QC**. Whilst most cell-line generated data-sets are consistent, organoid or solid-tissue samples are far more prone to high variability in the success of the IP step.
+- Cross Correlations: Shows the cross-correlation coefficients between read positions across a series of intervals [@LunSmythCsaw2014]. Weak cross-correlations can also indicate low-quality samples. These values are also used to estimate fragment length within each sample, as the peak value of the cross-correlations
+- Fraction Of Reads In Peaks (FRIP): This plot shows the proportion of the alignments which fall within peaks identified by `macs2 callpeak`, with the remainder of alignments being assumed to be background [@Landt01092012]. This can provide guidance as to the success of the IP protocol, and the common-use threshold of 1% is indicated as a horizontal line. This value is not enforced as a hard QC criteria, but may be used to manually exclude samples from the file `samples.tsv` of deemed to be appropriate.
+
+
+```{r macs2-logs-individual}
+emphasize.italics.rows(NULL)
+any_fail <- any(macs2_logs$qc == "fail")
+if (any_fail) emphasize.italics.rows(which(macs2_logs$qc == "fail"))
+macs2_logs %>%
+  dplyr::select(
+    sample = name, label,
+    total_peaks, 
+    reads = n_tags_treatment, read_length = tag_length,
+    fragment_length
+  ) %>%
+  rename_all(str_sep_to_title )%>%
+  pander(
+    justify = "llrrrr",
+    caption = glue(
+      "*Summary of results for `macs2 callpeak` on individual {target} samples.",
+      "Total peaks indicates the number retained after applying the FDR ", 
+      "threshold of {percent(peak_calling_params$fdr)} during peak calling.",
+      ifelse(
+        any_fail,
+        glue(
+          "Samples shown in italics were marked for exclusion from ",
+          "downstream analysis as they identified a number of peaks beyond ",
+          "+/- {peak_calling_params$outlier_threshold}-fold the median number of ",
+          "peaks amongst all samples within the relevant treatment group.",
+        ),
+        glue(
+          "No samples were identified as failing QC based on the number of ",
+          "peaks identified relative to the highest quality sample."
+        )
+      ),
+      "Any peaks passing the FDR cutoff, but which overlapped any black-listed",
+      "regions were additionally excluded. The fragment length as estimated by",
+      "`macs2 predictd` is given in the final column.",
+      case_when(
+        all(macs2_logs$paired_end) ~
+          "All input files contained paired-end reads.*",
+        all(!macs2_logs$paired_end) ~
+          "All input files contained single-end reads.*",
+        TRUE ~
+          "Input files were a mixture of paired and single-end reads*"
+      ),
+      .sep = " "
+    )
+  )
+```
+
+### Library Sizes
+
+```{r plot-macs2-libsize-individual, fig.height = 0.75 * fh, fig.cap = glue("*Library sizes for each {target} sample. The horizontal line indicates the mean library size for each treatment group. Any samples marked for exclusion as described above will be indicated with an (F)*")}
+macs2_logs %>%
+  ggplot(aes(label, n_tags_treatment, fill = qc)) +
+  geom_col(position = "dodge") +
+  geom_hline(
+    aes(yintercept = mn),
+    data = . %>%
+      group_by(treat) %>%
+      summarise(mn = mean(n_tags_treatment)),
+    linetype = 2,
+    col = "grey"
+  ) +
+  facet_grid(~treat, scales = "free_x", space = "free_x") +
+  scale_y_continuous(expand = expansion(c(0, 0.05)), labels = comma) +
+  scale_fill_manual(values = colours$qc) +
+  labs(
+    x = "Sample", y = "Library Size", fill = "QC"
+  ) +
+  ggtitle(glue("{target}: Library Sizes"))
+```
+
+### Peaks Detected
+
+```{r plot-macs2-peaks-individual, fig.height = 0.75 * fh, fig.cap = glue("*Peaks identified for each {target} sample. The number of peaks passing the inclusion criteria for `macs2 callpeak` (FDR < {peak_calling_params$merge_fdr}) are provided. Any samples marked for exclusion are coloured as indicated in the figure legend.*")}
+suppressWarnings(
+  macs2_logs %>%
+    ggplot(aes(label, total_peaks, fill = qc)) +
+    geom_col() +
+    geom_label(
+      aes(x = label, y = total_peaks, label = lab, colour = qc),
+      data = . %>%
+        dplyr::filter(total_peaks > 0) %>% 
+        mutate(
+          lab = comma(total_peaks, accuracy = 1), total = total_peaks
+        ),
+      nudge_y = 0.03 * max(macs2_logs$total_peaks),
+      inherit.aes = FALSE, show.legend = FALSE
+    ) +
+    facet_grid(~treat, scales = "free_x", space = "free_x") +
+    scale_y_continuous(expand = expansion(c(0, 0.05)), labels = comma) +
+    scale_fill_manual(values = colours$qc) +
+    scale_colour_manual(values = colours$qc) +
+    labs(
+      x = "Sample", y = "Total Peaks", fill = "QC"
+    ) +
+    ggtitle(glue("{target}: Number of Peaks"))
+)
+```
+
+### FRIP
+
+```{r plot-frip, fig.height = 0.75 * fh, fig.cap = glue("*Fraction of Reads In Peaks for each sample. Higher values indicate more reads specifically associated with the ChIP target ({target}). The common-use minimum value for an acceptable sample (1%) is shown as a dashed horizontal line*")}
+samples$sample %>%
+  bplapply(
+    function(x) {
+      gr <- individual_peaks[[x]]
+      rip <- 0
+      if (length(gr) > 0) {
+        sbp <- ScanBamParam(which = gr)
+        rip <- sum(countBam(bfl[[x]], param = sbp)$records)
+      }
+      tibble(name = x, reads_in_peaks = rip)
+    }
+  ) %>%
+  bind_rows() %>%
+  left_join(macs2_logs, by = "name") %>%
+  mutate(frip = reads_in_peaks / n_tags_treatment) %>%
+  ggplot(aes(label, frip, fill = qc)) +
+  geom_col() +
+  geom_hline(yintercept = 0.01, colour = "grey", linetype = 2) +
+  facet_grid(cols = vars(treat), scales = "free_x", space = "free") +
+  scale_y_continuous(labels = percent, expand = expansion(c(0, 0.05))) +
+  scale_fill_manual(values = colours$qc) +
+  labs(x = "Sample", y = "Fraction of Reads In Peaks", fill = "QC") +
+  ggtitle(glue("{target}: Fraction Of Reads In Peaks"))
+```
+
+### Cross Correlations
+
+```{r plot_correlation, fig.height = 0.75 * fh, fig.cap = glue("*Cross Correlaton between alignments up to 1kb apart. The dashed, grey, vertical line is the fragment length estimated by `macs2 callpeak` for each sample, with labels indicating the approximate point of the highest correlation, as representative of the average fragment length. For speed, only the first 5 chromosomes were used for sample-specific estimates.*")}
+all_paths$macs2 %>%
+  file.path(target, glue("{target}_cross_correlations.tsv")) %>% 
+  read_tsv() %>% 
+  left_join(samples, by = "sample") %>% 
+  ggplot(aes(fl, correlation, colour = treat)) +
+  geom_point(alpha = 0.1) +
+  geom_smooth(se = FALSE, method = 'gam', formula = y ~ s(x, bs = "cs")) +
+  geom_vline(
+    aes(xintercept = fragment_length),
+    data = macs2_logs,
+    colour = "grey40", linetype = 2
+  ) +
+  geom_label(
+    aes(label = fl),
+    data = . %>% 
+      mutate(correlation = correlation + 0.03 * max(correlation)) %>% 
+      dplyr::filter(correlation == max(correlation), .by = sample),
+    show.legend = FALSE, alpha = 0.7
+  ) +
+  facet_wrap(~label) +
+  scale_colour_manual(values = colours$treat[treat_levels]) +
+  scale_x_continuous(
+    breaks = seq(0, 5*max(macs2_logs$fragment_length), by = 200)
+  ) +
+  labs(
+    x = "Distance (bp)", y = "Cross Correlation", colour = "Treat"
+  ) +
+  ggtitle(glue("{target}: Cross Correlations"))
+```
+
+
+### GC Content
+
+```{r set-yield-size}
+ys <- 5e5
+yieldSize(bfl) <- ys
+```
+
+
+```{r plot-gc-content, dev = 'png', fig.height = 0.75 * fh, fig.cap = glue("*GC content for each bam file, taking the first {comma(ys)} alignments from each sample. QC status is based on the number of peaks identified (see table above)*")}
+bfl %>% 
+  bplapply(
+    function(x){
+      seq <- scanBam(x, param = ScanBamParam(what = "seq"))[[1]]$seq
+      freq <- letterFrequency(seq, letters = "GC") / width(seq)
+      list(freq[,1])
+    }
+  ) %>% 
+  as_tibble() %>% 
+  pivot_longer(
+    cols = everything(), names_to = "name", values_to = "freq"
+  ) %>% 
+  left_join(macs2_logs, by = "name") %>% 
+  unnest(freq) %>% 
+  ggplot(aes(label, freq, fill = qc)) +
+  geom_boxplot(alpha = 0.8) +
+  geom_hline(
+    aes(yintercept = med),
+    data = . %>% 
+      group_by(treat) %>% 
+      summarise(med = median(freq)),
+    linetype = 2,
+    colour = rgb(0.2, 0.2, 0.8)
+  ) +
+  facet_grid(~treat, scales = "free_x", space = "free_x") +
+  scale_y_continuous(labels = percent) +
+  scale_fill_manual(values = colours$qc) +
+  labs(x = "Sample", y = "GC content", fill = "QC") +
+  ggtitle(glue("{target}: GC Content"))
+```
+
+## Results
+
+### Individual Replicates {.tabset}
+
+Replicates within treatment groups are only shown where at least one peak was detected.
+For two or three replicates, Euler (Venn) Diagrams were generated using the `python` package `matplotlib-venn`.
+Peak numbers may differ from above as those shown below are overlapping peaks which have been merged across replicates
+
+In the case of four or more replicates, the package `ComplexUpset` was used to create UpSet plots [@Upset2014], with colours indicating QC status.
+
+#### All Samples
+
+```{r all-reps-upset, fig.cap = "*UpSet plot showing all samples including those which failed prior QC steps. Any potential sample mislabelling will show up clearly here as samples from each group should show a preference to overlap other samples within the same treatment group. Intersections are only included if 10 or more sites are present. The top panel shows a boxplot of the median $q$-values produced by `macs2 callpeak` for each peak in the intersection, excluding outliers. Only intersections with 10 or more peaks are shown, to a maximum of 30 intersections.*"}
+sets <- list(all = paste(samples$label, collapse = "; ")) %>% 
+  c(
+    samples %>% 
+      split(.$treat) %>% 
+      lapply(function(x) paste(x$label, collapse = "; "))
+  ) %>% 
+  unlist() %>%
+  .[!duplicated(.)]
+valid_sets <- makeConsensus(individual_peaks) %>% 
+  as_tibble() %>% 
+  pivot_longer(
+    cols = all_of(samples$sample), names_to = "sample", values_to = "has_peak"
+  ) %>% 
+  dplyr::filter(has_peak) %>% 
+  mutate(sample = sample2label[sample]) %>% 
+  summarise(
+    samples = paste(sample, collapse = "; "), .by = range
+  ) %>% 
+  distinct(samples) %>% 
+  dplyr::filter(samples %in% sets) %>% 
+  pull(samples) %>% 
+  setNames(map_chr(., \(x) names(which(sets == x)))) %>% 
+  lapply(function(x) str_split(x, "; ")[[1]])
+lb <- setNames(samples$label, samples$sample)
+individual_peaks %>%
+  setNames(lb[names(.)]) %>% 
+  makeConsensus(var = "qValue") %>% 
+  as_tibble() %>% 
+  mutate(
+    qValue = map_dbl(qValue, median),
+    highlight = case_when(
+      !!!imap(valid_sets, \(cols, name) if_all(all_of(cols)) ~ name)
+    )
+  ) %>% 
+  simpleUpSet(
+    sets = unname(lb), n_intersect = 30, sort_sets = NULL, min_size = 10,
+    set_layers = default_set_layers(
+      fill = "set", expand = c(0.25, 0),
+      scale_fill_manual(
+        values = colours$treat[as.character(samples$treat)] |> setNames(lb)
+      ),
+      guides(fill = guide_none()),
+      name = "Peaks Overlapping Consensus"
+    ),
+    intersect_layers = default_intersect_layers(
+      fill = "highlight", name = "Peaks in Intersection\n", expand = c(0, 0.1),
+      scale_fill_manual(
+        values = c(all = "darkorange", colours$treat), na.value = "grey23"
+      ),
+      guides(fill = guide_none())
+    ),
+    grid_layers = default_grid_layers(
+      colour = "highlight", name = "Intersection",
+      scale_colour_manual(
+        values = c(all = "darkorange", colours$treat), na.value = "grey23"
+      )
+    ),
+    annotations = list(
+      geom_boxplot(aes(y = qValue), outliers = FALSE),
+      scale_y_continuous(name = "Median qValue\n")
+    )
+  )
+```
+
+
+```{r plot-replicates}
+ranges_by_rep_treat <- individual_peaks %>%
+  unlist() %>% 
+  splitAsList(.$treat) %>% 
+  .[vapply(., length, integer(1)) > 1] %>% 
+  lapply(select, sample) %>% 
+  lapply(reduceMC) %>% 
+  lapply(as_tibble) %>% 
+  lapply(unnest, sample) %>% 
+  lapply(mutate, detected = 1) %>% 
+  lapply(left_join, dplyr::select(samples, sample, label), by = "sample") %>%
+  lapply(dplyr::select, -sample) %>% 
+  lapply(
+    function(x) split(x, x$label) %>% lapply(pull, "range")
+  )
+## First find the python executable
+which_py <- c(
+  file.path(Sys.getenv("CONDA_PREFIX"), "bin", "python3"),
+  Sys.which("python3")
+) %>% 
+  .[file.exists(.)] %>% 
+  .[1]
+stopifnot(length(which_py) == 1)
+rep_col <- hcl.colors(3, palette = "Zissou", rev = TRUE)
+htmltools::tagList(
+  names(ranges_by_rep_treat) %>% 
+    lapply(
+      function(i) {
+        x <- ranges_by_rep_treat[[i]]
+        fig_out <- file.path(fig_path, glue("{i}_replicates.{fig_type}"))
+        if (length(x) == 1) {
+          fig_fun(fig_out, width = fw, height = fh)
+          grid.newpage()
+          draw.single.venn(length(x[[1]]), category = names(x))
+          dev.off()
+        }
+        ## Euler diagrams for 2-3 replicates.
+        if (length(x) == 2) {
+          a12 <- sum(duplicated(unlist(x)))
+          a1 <- length(x[[1]]) - a12 
+          a2 <- length(x[[2]]) - a12
+          args <- glue(
+            here::here("scripts", "plot_venn.py "),
+            "-a1 {a1} -a2 {a2} -a12 {a12} ",
+            "-s1 '{names(x)[[1]]}' -s2 '{names(x)[[2]]}' ", 
+            "-c1 '{rep_col[[1]]}' -c2 '{rep_col[[3]]}' ",
+            "-ht {fh} ", 
+            "-w {fw} ", 
+            "-o '{fig_out}'"
+          )
+          system2(which_py, args)
+        }
+        if (length(x) == 3) {
+          a123 <- sum(table(unlist(x)) == 3)
+          a12 <- sum(table(unlist(x[1:2])) == 2) - a123
+          a13 <- sum(table(unlist(x[c(1, 3)])) == 2) - a123
+          a23 <- sum(table(unlist(x[c(2, 3)])) == 2) - a123
+          a1 <- length(x[[1]]) - (a12 + a13 + a123)
+          a2 <- length(x[[2]]) - (a12 + a23 + a123)
+          a3 <- length(x[[3]]) - (a13 + a23 + a123)
+          args <- glue(
+            here::here("scripts", "plot_venn.py "),
+            "-a1 {a1} -a2 {a2} -a12 {a12} -a3 {a3} ",
+            "-a13 {a13} -a23 {a23} -a123 {a123} ",
+            "-s1 '{names(x)[[1]]}' -s2 '{names(x)[[2]]}' -s3 '{names(x)[[3]]}' ", 
+            "-c1 '{rep_col[[1]]}' -c2 '{rep_col[[2]]}' -c3 '{rep_col[[3]]}' ",
+            "-ht {fh} ", 
+            "-w {fw} ", 
+            "-o '{fig_out}'"
+          )
+          system2(which_py, args)
+        }
+        ## An UpSet plot for > 3 replicates
+        if (length(x) > 3) {
+          fig_fun(fig_out, width = fw, height = fh)
+          grid.newpage()
+          ## Prep the data for ComplexUpset
+          df <- individual_peaks[dplyr::filter(samples, treat == i)$sample] %>% 
+            makeConsensus(var = "qValue") %>% 
+            mutate(qValue = vapply(qValue, median, numeric(1))) %>% 
+            as_tibble() %>% 
+            dplyr::rename_with(
+              function(x) setNames(samples$label, samples$sample)[x],
+              any_of(samples$sample)
+            )
+          ## Highlight samples by QC
+          ql <- samples %>% 
+            dplyr::filter(treat == i) %>% 
+            pull('label') %>% 
+            lapply(
+              function(x) {
+                i <- as.character(
+                  dplyr::filter(samples, treat == i, label == x)$qc
+                )
+                upset_query(set = x, fill = colours$qc[i])
+              }
+            )
+          ## And plot
+          p <- df %>% 
+            upset(
+              intersect = rev(dplyr::filter(samples, treat == i)$label),
+              base_annotations = list(
+                `Peaks in Intersection` = intersection_size(
+                  text_mapping = aes(label = comma(!!size)),
+                  bar_number_threshold = 1, text_colors = "black", 
+                  text = list(size = 4, hjust = 0.5)
+                ) +
+                  scale_y_continuous(expand = expansion(c(0, 0.2)), label = comma) +
+                  theme(
+                    text = element_text(size = 14),
+                    panel.grid = element_blank(), 
+                    axis.line = element_line(colour = "grey20"),
+                    panel.border = element_rect(colour = "grey20", fill =  NA)
+                  )
+              ),
+              annotations = list(
+                qValue = ggplot(mapping = aes(y = qValue)) +
+                  geom_boxplot(na.rm = TRUE, outlier.colour = rgb(0, 0, 0, 0.2)) +
+                  coord_cartesian(ylim = c(0, quantile(df$qValue, 0.99))) +
+                  scale_y_continuous(expand = expansion(c(0, 0.05))) +
+                  ylab(expr(paste("Macs2 ", q[med]))) +
+                  theme(
+                    text = element_text(size = 14),
+                    panel.grid = element_blank(), 
+                    axis.line = element_line(colour = "grey20"),
+                    panel.border = element_rect(colour = "grey20", fill =  NA)
+                  )
+              ),
+              set_sizes = (
+                upset_set_size() +
+                  geom_text(
+                    aes(label = comma(after_stat(count))), 
+                    hjust = 1.1, stat = 'count', size = 4
+                  ) +
+                  scale_y_reverse(expand = expansion(c(0.2, 0)), label = comma) +
+                  ylab(glue("Macs2 Peaks (FDR < {peak_calling_params$fdr})")) +
+                  theme(
+                    text = element_text(size = 14),
+                    panel.grid = element_blank(), 
+                    axis.line = element_line(colour = "grey20"),
+                    panel.border = element_rect(colour = "grey20", fill =  NA)
+                  )
+              ),
+              queries = ql,
+              min_size = 10,
+              sort_sets = FALSE
+            ) +
+            theme(text = element_text(size = 14)) +
+            patchwork::plot_layout(heights = c(2, 3, 2))
+          print(p)
+          dev.off()
+        }
+        
+        ## Define the caption
+        cp <- htmltools::tags$em(
+          glue(
+            "
+            Number of {target} peaks detected by macs2 callpeak in each {i} 
+            replicate and the number of peaks shared between replicates. 
+            Replicates which passed/failed QC are show in the specified colours.
+            "
+          )
+        )
+        
+        ## Create html tags
+        fig_link <- str_extract(fig_out, "assets.+")
+        htmltools::div(
+          htmltools::div(
+            id = glue("{i}-replicates"),
+            class = "section level4",
+            htmltools::h4(i),
+            htmltools::div(
+              class = "figure", style = "text-align: center",
+              htmltools::img(src = fig_link, width = 960),
+              htmltools::tags$caption(cp)
+            )
+          )
+        )
+      }
+    )
+)
+```
+
+#### Individual Peak Widths
+
+```{r plot-peak-width, fig.cap = glue("*Range of peak widths across all samples. The median value for all peaks ({median(width(unlist(individual_peaks)))}bp) is shown as the dashed horizontal line. The y-axis is log-transformed.*")}
+individual_peaks %>% 
+  width() %>% 
+  as.list() %>% 
+  lapply(list) %>% 
+  as_tibble() %>% 
+  pivot_longer(cols = everything(), names_to = "sample", values_to = "width") %>% 
+  unnest(width) %>% 
+  left_join(samples, by = "sample") %>% 
+  ggplot(aes(label, width, fill = treat)) +
+  geom_boxplot(alpha = 0.9) +
+  geom_hline(
+    yintercept = median(width(unlist(individual_peaks))),
+    linetype = 2
+  ) +
+  facet_wrap(~treat, nrow = 1, scales = "free_x") +
+  scale_y_log10() +
+  scale_fill_manual(values = colours$treat) +
+  labs(x = "Sample", y = "Peak Width (bp)", fill = "Treatment")
+```
+
+### Filtered Peaks 
+
+A set of treatment-specific `r target` peaks was defined for each of `r pander(treat_levels)` by comparing the peaks detected when merging all treatment-specific samples, against those detected within each replicate.
+Replicates which failed the previous QC steps were omitted during peak-calling.
+
+Peaks detected when merging samples, and which overlapped a peak in more than `r percent(peak_calling_params$min_prop_reps)` of the *individual replicates passing QC* in each treatment group, were retained.
+Those additionally overlapping any black- or grey-listed regions were also removed as viable peaks.
+
+```{r tab-treatment-peak}
+treat_levels %>% 
+  lapply(
+    \(i) tibble(
+      treat = i,
+      detected_peaks = length(merged_peaks[[i]]),
+      retained = length(filtered_peaks[[i]]),
+      `% retained` = percent(retained / detected_peaks, 0.1),
+      median_width = median(width(filtered_peaks[[i]]))
+    )
+  ) %>% 
+  bind_rows() %>% 
+  mutate(treat = factor(treat, levels = treat_levels)) %>% 
+  group_by(treat) %>% 
+  rename_all(str_sep_to_title) %>% 
+  dplyr::rename(`% Retained` = ` Retained`) %>% 
+  pander(
+    justify = "lrrrr",
+    caption = glue(
+      "Treatment-specific peaks detected by merging samples within each",
+      "treatment group. Peaks were only retained if detected in at least",
+      "{percent(peak_calling_params$min_prop_reps)} of the qc-passing samples for each treatment group,",
+      "as described above.",
+      .sep = " "
+    )
+  )
+```
+
+### Consensus Peaks {.tabset}
+
+After filtering peaks, a set of `r comma(length(consensus_peaks))` treatment-agnostic `r target` **consensus peaks** were defined.
+These ranges represent the *union* of all overlapping ranges defined and retained within any treatment.
+
+Resulting values for the `score` were calculated as the *maximum* across all treatments.
+*Peak summits* were taken as the weighted mean position of all summits which comprise the union peak, using the score as weights.
+
+#### `r ifelse(length(treat_levels) < 3, "Venn Diagram", "Upset Plot")`
+
+```{r plot-common-peaks, fig.width = ifelse(length(treat_levels) < 3, 0.7 * fw, fw), fig.height = 0.7 * fw, fig.cap = glue("*Number of {target} consensus peaks which overlap the filtered peaks defined within each condition.*")}
+plotOverlaps(
+  filtered_peaks, exp_sets = 1/3,
+  type = ifelse(length(treat_levels) > 2, "upset", "venn"),
+  set_col = colours$treat[treat_levels],
+)
+```
+
+#### Distance to TSS
+
+```{r plot-union-dist-to-tss-hist, fig.height = 0.75 * fh, fig.cap = glue("*Distances from the centre of the {target} consensus peak to the transcription start-site shown as A) a histogram, and B) as a cumulative distribution. The vertical dashed line indicates the range considered to be a promoter during annotation preparation. {comma(sum(overlapsAny(consensus_peaks, tss)))} of the {comma(length(consensus_peaks))} {target} consensus peaks ({percent(mean(overlapsAny(consensus_peaks, tss)), 0.1)}) directly overlapped a TSS.*")}
+a <- consensus_peaks %>% 
+  join_nearest(mutate(tss, tss = start)) %>% 
+  mutate(d = start + width/2 - tss) %>% 
+  as_tibble() %>% 
+  ggplot(aes(d / 1e3)) +
+  geom_density() +
+  coord_cartesian(xlim = c(-50, 50)) +
+  labs(
+    x = "Distance Around Nearest TSS (kb)",
+    y = "Density"
+  )
+b <- consensus_peaks %>% 
+  join_nearest(
+    mutate(tss, tss = start)
+  ) %>% 
+  mutate(d = start + width/2 - tss) %>%
+  as_tibble() %>% 
+  select(d) %>% 
+  arrange(abs(d)) %>% 
+  mutate(
+    q = seq_along(d) / nrow(.)
+  ) %>% 
+  ggplot(aes(abs(d) / 1e3, q)) +
+  geom_line() +
+  geom_vline(
+    xintercept = max(unlist(region_params$promoters)) / 1e3, 
+    linetype = 2, colour = "grey40"
+  ) +
+  coord_cartesian(xlim = c(0, 50)) +
+  labs(
+    x = "Absolute Distance to Nearest TSS (kb)",
+    y = "Percentile"
+  ) +
+  scale_y_continuous(labels = percent, breaks = seq(0, 1, by = 0.2)) +
+  scale_x_continuous(breaks = seq(0, 100, by = 20))
+a + b + plot_annotation(tag_levels = "A")
+```
+
+#### Gene-Centric Regions
+
+```{r plot-region-overlap, fig.height = 0.8 * fw, fig.width = 0.8 * fw, fig.cap = glue("*Proportions of {target} consensus peaks which overlap gene-centric features.*")}
+consensus_peaks %>% 
+  plotPie(
+    fill = "region", total_size = 4,
+    cat_glue = "{str_wrap(.data[[fill]], 15)}\n{comma(n, 1)}\n({percent(p, 0.1)})",
+    cat_alpha = 0.9, cat_adj = 0.05, min_p = 0.025
+  ) +
+  scale_fill_manual(values = region_colours) +
+  theme(legend.position = "none")
+```
+
+`r ifelse(has_features, "#### External Features", "")`
+
+```{r plot-peaks-by-feature, echo = has_features, fig.height = ifelse(length(feat_names) < 3, fh / 2, fh), fig.cap = glue("*{target} peaks which overlap each provided feature, coloured by gene-centric regions defined previously. Features may overlap with each other, and as such, peaks may overlap multiple feature types and be included within multiple categories. Total overlapping peaks for each feature type are shown in bold, wth percentages being relative to the total number of consensus peaks ({comma(length(consensus_peaks))}). Individual segments are labelled if representing >= 3% of the total number of peaks. Features with fewer than 1% of peaks aligning to them are collapsed into the category 'Other'*")}
+if (has_features) {
+  consensus_peaks %>% 
+    as_tibble() %>% 
+    dplyr::select(range, region, feature) %>% 
+    unnest(feature, keep_empty = TRUE) %>%
+    mutate(
+      feature = case_when(
+        is.na(feature)~ "no_feature",
+        is.null(names(feature)) ~ feature,
+        TRUE ~ paste(names(feature), feature, sep = ": ")
+      ) %>% 
+        str_remove_all("^ *:")
+    ) %>% 
+    distinct(range, region, feature) %>% 
+    mutate(feature = fct_infreq(feature) %>% fct_lump_prop(0.01)) %>% 
+    dplyr::summarise(n = dplyr::n(), .by = c(region, feature)) %>% 
+    arrange(desc(region)) %>% 
+    mutate(label_x = cumsum(n) - 0.5*n, .by = c(feature)) %>% 
+    ggplot(aes(n, y = fct_rev(feature))) +
+    geom_col(aes(fill = region)) +
+    geom_label(
+      aes(x = N, label = label),
+      data = . %>% 
+        summarise(N = sum(n), .by = feature) %>% 
+        mutate(
+          p = N / length(consensus_peaks),
+          label = glue("{comma(N)}\n{percent(p, 0.1)}"),
+          N = N + 0.05 * max(N)
+        ),
+      hjust = 0.5, size = 3, fontface = 'bold'
+    ) +
+    geom_label(
+      aes(label_x, fct_rev(feature), label = label),
+      data = . %>% 
+        dplyr::filter(n > 0.03 * length(consensus_peaks)) %>% 
+        mutate(
+          label = glue("{comma(n)}\n{percent(n / length(consensus_peaks), 0.1)}")
+        ),
+      alpha = 0.6, size = 3
+    ) +
+    scale_fill_manual(values = region_colours, labels = label_wrap(10)) +
+    scale_x_continuous(expand = expansion(c(0, 0.1)), labels = comma) +
+    labs(
+      x = glue("Total Overlapping {target} Peaks"), 
+      y = "Feature", fill = "Region"
+    ) +
+    theme(
+      legend.key.height = unit(0.5 / length(regions), "npc")
+    )
+}
+```
+
+## Peak Visualisation
+
+```{r prepare-plot-objects}
+cb <- config$genome$build %>%
+  str_to_lower() %>% 
+  paste0(".cytobands") 
+data(list = cb)
+bands_df <- get(cb)
+## The coverage
+bwfl <- list2(
+  "{target}" := all_paths$macs2 %>%
+    file.path(target, glue("{target}_{treat_levels}_merged_treat_pileup.bw")) %>% 
+    BigWigFileList() %>% 
+    setNames(treat_levels)
+)
+line_col <- lapply(bwfl, function(x) unlist(colours$treat[names(x)]))
+## The features track
+feat_gr <- gene_regions %>% 
+  lapply(granges) %>% 
+  GRangesList()
+feature_colours <- colours$regions
+featnames <- "Regions"
+if (has_features) {
+  feat_gr <- list(Regions = feat_gr) %>% 
+    c(
+      lapply(features, \(x) endoapply(splitAsList(x, x$feature), granges))
+    )
+  feature_colours <- feat_gr %>% lapply(\(x) full_palette[names(x)])
+  featnames <- names(feat_gr) %>% str_sep_to_title(replacement = "\n")
+}
+## The genes track defaults to transcript models
+hfgc_genes <- read_rds(
+  here::here("output", "annotations", "trans_models.rds")
+)
+gene_col <- "grey"
+collapseTrans <- "auto"
+if (has_rna) {
+  hfgc_genes <- hfgc_genes %>% 
+    mutate(
+      Detected = ifelse(
+        gene %in% bind_rows(rna)$gene_id, "Detected", "Undetected"
+      )
+    ) %>% 
+    split(.$Detected)
+  gene_col <- c(
+    Detected = colours$direction[["unchanged"]],
+    Undetected = colours$direction[["undetected"]]
+  )
+  collapseTrans <- list(Detected = "auto", Undetected = "meta")
+}
+
+## External Coverage (Optional)
+if (!is.null(config$external$coverage)) {
+  ext_cov_path <- config$external$coverage %>% 
+    lapply(unlist) %>% 
+    lapply(function(x) setNames(here::here(x), names(x)))
+  bwfl <- c(
+    bwfl[target],
+    config$external$coverage %>% 
+      lapply(
+        function(x) {
+          BigWigFileList(here::here(unlist(x))) %>% 
+            setNames(names(x))
+        }
+      )
+  )
+}
+```
+
+### Highly Ranked Peaks {.tabset}
+
+```{r select-highly-ranked}
+grl_to_plot <- GRangesList()
+grl_to_plot$consensus <- consensus_peaks %>% 
+  subset(score == max(score)) %>% 
+  granges()
+for (i in treat_levels) {
+  grl_to_plot[[i]] <- filtered_peaks[[i]] %>% 
+    filter_by_non_overlaps(filtered_peaks[names(filtered_peaks) != i]) %>% 
+    subset(score == max(score)) %>% 
+    granges() %>% 
+    unname() %>% 
+    .[1]
+}
+y_lim <- bwfl %>%
+  lapply(
+    function(x) {
+      gr <- unlist(grl_to_plot) %>% 
+        resize(width = 30 * width(.), fix = 'center')
+      x %>% 
+        lapply(import.bw, which = gr) %>%
+        lapply(function(rng) c(0, max(rng$score))) %>%
+        unlist() %>%
+        range()
+    }
+  )
+```
+
+Coverage for a small set of highly ranked peaks are shown below.
+These are the most highly ranked Consensus Peak (by `score`) and the most highly ranked peak for each of `r pander(treat_levels)` which was unique to that set of filtered peaks, without being identified in any other treatment group.
+
+```{r plot-highly-ranked}
+htmltools::tagList(
+  lapply(
+    seq_along(grl_to_plot),
+    function(i) {
+      nm <- names(grl_to_plot)[[i]]
+      ## Export the figure
+      fig_out <- file.path(
+        fig_path,
+        nm %>% 
+          str_replace_all(" ", "_") %>% 
+          paste0("_topranked.", fig_type)
+      )
+      fig_fun(filename = fig_out, width = fw, height = fh)
+      
+      ## Generate the plot
+      plotHFGC(
+        grl_to_plot[[i]],
+        hic = hic,
+        features = feat_gr, featcol = feature_colours, featname = featnames,
+        featsize = max(1, 0.8 * length(feat_gr)), featstack = "dense",
+        genes = hfgc_genes, genecol = gene_col, 
+        genesize = rep_len(c(2, 1), length(hfgc_genes)),
+        coverage = bwfl, linecol = line_col, ylim = y_lim,
+        cytobands = bands_df,
+        collapseTranscripts = collapseTrans, maxTrans = 15,
+        zoom = 20, max = max(1e4, width(range(grl_to_plot[[i]]))),
+        col.title = "black", background.title = "white", 
+        rotation.title = 90, showAxis = FALSE, fontsize = 10,
+        highlight = rgb(0, 0, 1, 0.3)
+      )
+      dev.off()
+      
+      ## Define the caption
+      gr <- join_nearest(grl_to_plot[[i]], gtf$gene, distance = TRUE)
+      d <- gr$distance
+      gn <- gr$gene_name
+      peak_desc <- ifelse(
+        nm == "union",
+        "union peak by combined score across all treatments.",
+        paste(
+          "treatment-peak unique to the merged", nm, "samples."
+        )
+      )
+      cp <- htmltools::tags$em(
+        glue(
+          "The most highly ranked {peak_desc} ",
+          ifelse(
+            d == 0,
+            paste('The peak directly overlaps', gn),
+            paste0("The nearest gene was ", gn, ", ", round(d/1e3, 1), "kb away")
+          ),
+          "
+          . Y-axes for each coverage track are set to the most highly ranked peak
+          across all conditions.
+          "
+        )
+      )
+      
+      ## Create html tags
+      fig_link <- str_extract(fig_out, "assets.+")
+      htmltools::div(
+        htmltools::div(
+          id = nm %>% 
+            str_replace_all(" ", "-") %>% 
+            str_to_lower() %>% 
+            paste0("-topranked"),
+          class = "section level4",
+          htmltools::h4(
+            paste("Top Ranked", nm, "Peak")
+          ),
+          htmltools::div(
+            class = "figure", style = "text-align: center",
+            htmltools::img(src = fig_link, width = 960),
+            htmltools::p(
+              class = "caption", htmltools::tags$caption(cp)
+            )
+          )
+        )
+      )
+    }
+  )
+)  
+```
+
+### Low Ranked Peaks {.tabset}
+
+```{r select-low-ranked}
+grl_to_plot <- GRangesList()
+grl_to_plot$consensus <- consensus_peaks %>% 
+  subset(score == min(score)) %>% 
+  granges() %>% 
+  .[sample.int(length(.), 1)]
+for (i in treat_levels) {
+  grl_to_plot[[i]] <- filtered_peaks[[i]] %>% 
+    filter_by_non_overlaps(grl_to_plot$consensus) %>% 
+    subset(score == min(score)) %>% 
+    granges() %>% 
+    unname() %>% 
+    .[1]
+}
+```
+
+As a counter to the highly ranked peaks, coverage for a small set of *low ranking peaks* are shown below as representative of the low confidence calls.
+These are the most low-ranked consensus peak (by `score`) and the most low-ranked peak for each of `r pander(treat_levels)` which was unique to that set of filtered peaks, without being identified in any other treatment group.
+These effectively represent the *low-probability peak calls*, and it may be assumed that, from a quality assessment perspective, the majority of peaks will lie **somewhere between the highly-ranked and low-ranked peaks**.
+
+```{r plot-low-ranked}
+htmltools::tagList(
+  lapply(
+    seq_along(grl_to_plot),
+    function(i) {
+      nm <- names(grl_to_plot)[[i]]
+      ## Export the figure
+      fig_out <- file.path(
+        fig_path,
+        nm %>% 
+          str_replace_all(" ", "_") %>% 
+          paste0("_lowranked.", fig_type)
+      )
+      fig_fun(filename = fig_out, width = fw, height = fh)
+      ## Generate the plot
+      plotHFGC(
+        grl_to_plot[[i]],
+        hic = hic,
+        features = feat_gr, featcol = feature_colours, featname = featnames,
+        featsize = max(1, 0.8 * length(feat_gr)), featstack = "dense",
+        genes = hfgc_genes, genecol = gene_col, 
+        genesize = rep_len(c(2, 1), length(hfgc_genes)),
+        coverage = bwfl, linecol = line_col, ylim = y_lim,
+        cytobands = bands_df,
+        collapseTranscripts = collapseTrans, maxTrans = 15,
+        zoom = 20, max = max(1e4, width(range(grl_to_plot[[i]]))),
+        col.title = "black", background.title = "white", 
+        rotation.title = 90, showAxis = FALSE, fontsize = 10,
+        highlight = rgb(0, 0, 1, 0.3)
+      )
+      dev.off()
+      
+      ## Define the caption
+      gr <- join_nearest(grl_to_plot[[i]], gtf$gene, distance = TRUE)
+      d <- gr$distance
+      gn <- gr$gene_name
+      peak_desc <- ifelse(
+        nm == "union",
+        "union peak by combined score across all treatments.",
+        paste(
+          "treatment-peak unique to the merged", nm, "samples."
+        )
+      )
+      cp <- htmltools::tags$em(
+        glue(
+          "The most low-ranked {peak_desc} ",
+          ifelse(
+            d == 0,
+            paste('The peak directly overlaps', gn),
+            paste0("The nearest gene was ", gn, ", ", round(d/1e3, 1), "kb away")
+          ),
+          "
+          . Y-axes for each coverage track are set to the most highly ranked peak
+          across all conditions.
+          "
+        )
+      )
+      
+      ## Create html tags
+      fig_link <- str_extract(fig_out, "assets.+")
+      htmltools::div(
+        htmltools::div(
+          id = nm %>% 
+            str_replace_all(" ", "-") %>% 
+            str_to_lower() %>% 
+            paste0("-lowranked"),
+          class = "section level4",
+          htmltools::h4(
+            paste("Low Ranked", nm, "Peak")
+          ),
+          htmltools::div(
+            class = "figure", style = "text-align: center",
+            htmltools::img(src = fig_link, width = 960),
+            htmltools::p(
+              class = "caption", htmltools::tags$caption(cp)
+            )
+          )
+        )
+      )
+    }
+  )
+)  
+```
+
+`r if (has_rna) "## Relationship to Transcriptomic Data"`
+
+```{r tbl-rna, echo = has_rna}
+if (has_rna) {
+  lapply(
+    rna,
+    \(x) {
+      tibble(
+        gene_id = gtf$gene$gene_id,
+        detected = gene_id %in% x$gene_id,
+        has_peak = gene_id %in% unlist(consensus_peaks$gene_id)
+      ) %>% 
+        summarise(
+          n = dplyr::n(), .by = c(detected, has_peak)
+        ) %>% 
+        pivot_wider(names_from = "has_peak", values_from = "n", names_prefix = "peak_")
+    }
+  ) %>% 
+    lapply(
+      \(x) {
+        mat <- as.matrix(x[-1])
+        p <- fisher.test(mat)$p.value
+        tibble(
+          Detected = sum(mat[2,]),
+          `Detected With Peak` = mat[2, 2],
+          `% With Peak` = percent(`Detected With Peak` / Detected, 0.1),
+          p
+        )
+      }
+    ) %>% 
+    bind_rows(.id = "Dataset") %>% 
+    mutate(
+      p = ifelse(p < 0.001, sprintf("%.2e", p), sprintf("%.3f", p))
+    ) %>% 
+    pander(
+      justify = "lrrrr",
+      caption = glue(
+        "
+        *Relationship of RNA data to genes with peaks mapped to them.
+        Fisher's Exact Test was performed to determine any association bewteen 
+        a gene being detected in the transcriptomic data, and a {target} peak 
+        being mapped to that gene. Taking the reported p-value, any significant 
+        association implies that {target} is likely
+        to be playing a regulatory role within that dataset. A total of 
+        {comma(length(gtf$gene))} genes are contained in the provided GTF.*
+        "
+      )
+    )
+}
+```
+
+`r if (has_rna) "### Detected Genes by Signal Region {.tabset}"`
+
+```{r tbl-rna-by-region, echo = FALSE}
+if (has_rna) {
+  tagList(
+    names(rna) %>% 
+      lapply(
+        \(i) {
+          x <- rna[[i]]
+          no_peak <- tibble(
+            region = "No Detected Peak",
+            total = gtf$gene$gene_id %>% 
+              setdiff(unlist(consensus_peaks$gene_id)) %>% 
+              unique() %>% 
+              length(),
+            detected = x$gene_id %>% 
+              setdiff(unlist(consensus_peaks$gene_id)) %>% 
+              unique() %>% 
+              length(),
+            prop = detected / total,
+            undetected = total - detected
+          )
+          if (has_features) no_peak$feature <- no_peak$region
+          tbl_id <- paste("tbl", i, "detected-by-region", sep = "-")
+          tbl <- consensus_peaks %>% 
+            as_tibble() %>% 
+            dplyr::select(any_of(c("region", "feature")), gene_id) %>%
+            unnest(any_of("feature")) %>% 
+            unnest(gene_id) %>% 
+            left_join(x, by = "gene_id") %>% 
+            mutate(
+              detected = !is.na(logFC),
+              across(
+                any_of("feature"),
+                \(x) {
+                  case_when(
+                    is.na(x)~ "no_feature",
+                    is.null(names(x)) ~ x,
+                    TRUE ~ paste(names(x), x, sep = ": ")
+                  ) %>% 
+                    str_remove_all("^ *:")
+                }
+              )
+            ) %>%
+            distinct(
+              !!!syms(intersect(c("region", "feature", "gene_id"), colnames(.))),
+              .keep_all = TRUE
+            ) %>% 
+            summarise(
+              total = length(unique(gene_id)),
+              detected = sum(detected),
+              undetected = total - detected,
+              prop = detected / total,
+              .by = any_of(c("feature", "region"))
+            ) %>% 
+            mutate(
+              p = map_dbl(
+                seq_len(nrow(.)), 
+                \(i) fisher.test(
+                  bind_rows(.[i,], no_peak)[c("detected", "undetected")],
+                  alternative = "greater"
+                )$p.value
+              ),
+              adj_p = p.adjust(p, "fdr")
+            ) %>% 
+            arrange(p) %>% 
+            mutate(
+              source = str_extract(feature, ".+: ") %>% 
+                str_remove_all(": ") %>% 
+                str_replace_na(""),
+              feature = str_remove_all(feature, ".+: ")
+            ) %>% 
+            dplyr::select(source, feature, region, everything()) %>% 
+            dplyr::select(where(\(x) !all(x == ""))) %>% 
+            dplyr::filter(adj_p < 0.05) %>% 
+            reactable(
+              showPageSizeOptions = TRUE, sortable = TRUE,
+              filterable = TRUE, searchable = TRUE,
+              columns = list(
+                source = colDef(
+                  "Source",
+                  filterInput = \(values, name) drop_filter(values, name, tbl_id)
+                ),
+                region = colDef(
+                  "Region",
+                  style = \(value) {
+                    bg <- do.call(
+                      "rgb", 
+                      as.list(c(col2rgb(region_colours[[value]])[,1]/255, alpha = 0.7))
+                    )
+                    list(backgroundColor = bg)
+                  },
+                  filterInput = \(values, name) drop_filter(values, name, tbl_id)
+                ),
+                feature = colDef(
+                  "Feature",
+                  style = \(value) {
+                    bg <- do.call(
+                      "rgb", 
+                      as.list(c(col2rgb(region_colours[[value]])[,1]/255, alpha = 0.7))
+                    )
+                    list(backgroundColor = bg)
+                  },
+                  filterInput = \(values, name) drop_filter(values, name, tbl_id)
+                ),
+                total = colDef(
+                  glue("Mapped to {target} Peak"), format = comma_col,
+                  filterMethod = js_greater
+                ),
+                detected = colDef(
+                  "Detected", format = comma_col, filterMethod = js_greater
+                ),
+                undetected = colDef(
+                  "Not Detected", format = comma_col, filterMethod = js_greater
+                ),
+                prop = colDef(
+                  "% Detected", format = percent_col, filterMethod = js_greater
+                ),
+                p = colDef(show = FALSE),
+                adj_p = colDef(
+                  "P<sub>adj</adj>", html = TRUE, 
+                  cell = \(value) sprint_pval(value),
+                  filterMethod = js_less
+                )
+              )[colnames(.)],
+              columnGroups = list(
+                colGroup("Gene Expression", str_subset(names(.), "(detected|prop)$"))
+              ),
+              elementId = tbl_id
+            )
+          cp <- htmltools::em(
+            glue(
+              "
+              Genes mapped to {target} peaks broken down by region and any 
+              additional provided features, along with whether they were 
+              detected in the trancriptomic dataset {i}. Fisher's test was 
+              performed for each region by comparing against genes for which no 
+              peak was detected with all p-values being FDR-adjusted. This 
+              effectively tests H0 that there is no difference in the 
+              association between a gene being detected, and having detectable 
+              {target} signal within that region. An 
+              additional {comma(no_peak$detected)} genes were detected in this
+              dataset without any evidence of associated {target} signal.
+              Only significant associations are shown.
+            "
+            )
+          )
+          htmltools::div(
+            id = paste(i, "-detected-by-region"),
+            class = "section level4",
+            htmltools::h4(i),
+            tagList(
+              htmltools::tags$caption(cp),
+              tags$button(
+                tagList(fontawesome::fa("download"), "Download as CSV"),
+                onclick = glue(
+                  "Reactable.downloadDataCSV('{tbl_id}', '{target}_{tbl_id}.csv')"
+                )
+              ),
+              tags$button(
+                "Expand/Collapse All",
+                onclick = glue("Reactable.toggleAllRowsExpanded('{tbl_id}')")
+              ),
+              tags$button(
+                "Clear All Filters",
+                onclick = glue("Reactable.setAllFilters('{tbl_id}', [])")
+              ),
+              tbl
+            )
+          )
+        }
+      )
+  )
+}
+```
+
+## Gene-Set Enrichment Testing
+
+```{r setup-enrichment}
+## Set parameters for enabling networks, handling possible NULLs
+min_network_size <- min(network_params$size)
+max_network_size <- max(network_params$size)
+max_network_dist <- c(network_params$max_distance, 1)[[1]]
+net_layout <- c(network_params$layout, "fr")[[1]]
+enrich_method <- match.arg(enrich_params$method, c("great", "gene_id"))
+msigdb <- here::here(all_paths$annotation, "msigdb.rds") %>% read_rds()
+gs_url <- msigdb$gs_url[!duplicated(names(msigdb$gs_url))]
+```
+
+`r desc_enrichment(enrich_method)`
+
+For this specific analysis, the background ranges were set to be the whole genome.
+`r if (enrich_method == "gene_id") "Widths of the genomic regions spanned by a gene were taken as a bias offset term with testing [@YoungGoseq2010]."`
+
+### Results {.tabset}
+
+```{r run-enrichment}
+enrich_arg_list <- list(
+  test_ranges = consensus_peaks, db = msigdb, gtf = gtf$gene, bg = NULL, 
+  genome = ucsc$build, min_sig = enrich_params$min_sig, threads = threads, 
+  adj_method = enrich_params$adj, params = region_params$promoters, 
+  method = "Wallenius"
+)
+if (enrich_method == "great") 
+  enrich_df <- do.call(".great_enrich", enrich_arg_list)
+if (enrich_method == "gene_id")
+  enrich_df <- do.call(".geneid_enrich", enrich_arg_list)
+n_enrich <- sum(enrich_df$adj_p < enrich_params$alpha)
+tg_enrich <- enrich_df %>% 
+  dplyr::filter(adj_p < enrich_params$alpha) %>%
+  mutate(
+    p = ifelse(p > 0, p, 1e-16),
+    prop = observed_gene_hits / gene_set_size 
+  ) %>% 
+  make_tbl_graph(
+    gs = .$gene_id, 
+    alpha = enrich_params$alpha, p_col = "adj_p", gs_col = "gs_name", 
+    hit_col = "observed_gene_hits", size_col = "gene_set_size", 
+    min_dist = max_network_dist, max_gs = max_network_size
+  )
+```
+
+Pathways will be considered as enriched relative to background if returned an adjusted p-value (`r enrich_params$adj`) below `r enrich_params$alpha`.
+sing this strategy `r n_enrich` pathways were considered to be enriched within the set of `r target` consensus peaks.
+
+`r if (n_enrich > 0) "#### Results Table"`
+
+```{r tbl-enrich-res, eval = n_enrich > 0, echo = FALSE}
+tbl_id <- "enrich-res-table"
+tbl <- enrich_df %>% 
+  dplyr::filter(adj_p < enrich_params$alpha) %>% 
+  dplyr::slice(seq_len(100)) %>%
+  dplyr::select(-any_of(c("gene_id"))) %>% 
+  dplyr::select(
+    gs_name, genes_with_hits, contains("gene"), everything()
+  ) %>% 
+  reactable(
+    sortable = TRUE, filterable = TRUE, showPageSizeOptions = TRUE, 
+    columns = enrich_cols[colnames(.)],
+    details =  function(index){
+      htmltools::div(
+        htmltools::tags$pre(
+          str_wrap(
+            paste(capture.output(enrich_df$genes_with_hits[index]), collapse = "\n"),
+            width = 120
+          )
+        )
+      )
+    },
+    elementId = tbl_id
+  )
+cp <- htmltools::em(
+  glue(
+    "
+    Enrichment results for regions showing consistently detectable signal for 
+    {target}, using an adjusted p-value 
+    ({enrich_params$adj}) < {enrich_params$alpha} to determine significance. 
+    The backround to determine relative enrichment was taken as the entire 
+    genome. In the case of large numbers of significant gene-sets, results are 
+    limited to the 100  most highly ranked. For gene-sets where the analysis has
+    returned a p-value of zero, the value <2e-16 will be printed.
+    "
+  )
+)
+tl <- tagList(
+  htmltools::tags$caption(cp),  
+  tags$button(
+    tagList(fontawesome::fa("download"), "Download as CSV"),
+    onclick = glue(
+      "Reactable.downloadDataCSV('{tbl_id}', '{target}_enrich_res.csv')"
+    )
+  ),
+  tags$button(
+    "Expand/Collapse All",
+    onclick = glue("Reactable.toggleAllRowsExpanded('{tbl_id}')")
+  ),
+  tags$button(
+    "Clear All Filters",
+    onclick = glue("Reactable.setAllFilters('{tbl_id}', [])")
+  ),
+  tbl
+)
+htmltools::browsable(tl)
+```
+
+`r if (n_enrich > min_network_size) "#### Network Plot"`
+
+```{r great-network, echo = n_enrich > min_network_size, eval = n_enrich > min_network_size, fig.cap = glue("*The {n_enrich} most highly ranked gene sets from enrichment analysis. Edge thickness denotes simiarity between connected nodes. Lighter node colours indicate increased significance. Label transparency and the outline thickness of each node also represent the proportion of each gene set mapped to a range with detected {target}. Node size indicates the number of genes mapped to a range. Networks are capped at a maximum of {max_network_size} gene sets*")}
+tg_enrich %>% 
+  ggraph(layout = net_layout, weights = oc) +
+  geom_edge_link(aes(width = oc^2, alpha = oc^2)) +
+  geom_node_point(
+    aes(
+      fill = -log10(p), size = observed_gene_hits, stroke = 1.5 * prop
+    ),
+    shape = 21
+  ) +
+  geom_node_text(
+    aes(label = label, alpha = prop),
+    colour = "black", size = 3, 
+    data = . %>%
+      mutate(
+        label = str_replace_all(label, "_", " ") %>% 
+          str_trunc(60) %>% 
+          str_wrap(width = 18)
+      ),
+    repel = TRUE, max.overlaps = max(10, round(length(tg_enrich) / 4, 0)),
+    bg.color = "white", bg.r = 0.1, 
+  ) +
+  scale_x_continuous(expand = expansion(c(0.1, 0.1))) +
+  scale_y_continuous(expand = expansion(c(0.1, 0.1))) +
+  scale_fill_viridis_c(option = "inferno", begin = 0.2) +
+  scale_alpha(range = c(0.5, 1), trans = "sqrt") +
+  scale_size_continuous(range = c(1, 10)) +
+  scale_edge_width(range = c(1, 6), limits = c(0, 1)) +
+  scale_edge_alpha(range = c(0.1, 0.4), limits = c(0, 1))  +
+  guides(edge_alpha = "none", edge_width = "none", alpha = "none") +
+  labs(size = "Mapped\nGenes", fill = expr(paste("-", log[10], "p"))) +
+  theme_void() 
+```
+
+## Region Analysis {.tabset}
+
+```{r load-localz}
+mlz <- all_paths$peaks %>% 
+  file.path("{target}", "{target}_regions_localz.rds") %>% 
+  glue() %>% 
+  read_rds()
+localz_df <- slot(mlz, "multiLocalZscores")$resumeTab %>%
+  as_tibble() %>% 
+  dplyr::rename(region = name) %>% 
+  mutate(
+    p_value = 1 - pchisq(norm_zscore^2, 1),
+    adj.p_value = p.adjust(p_value, regioner_params$adj)
+  ) %>% 
+  mutate(
+    region = case_when(
+      region %in% names(regions) ~ regions[region],
+      TRUE ~ region
+    ) %>% 
+      factor(all_regions),
+    enrichment = log2(n_overlaps / mean_perm_test),
+    prop = n_overlaps / length(consensus_peaks)
+  ) 
+shifted_z <- slot(mlz, "multiLocalZscores")$shifed_ZSs %>% 
+  as_tibble() %>% 
+  mutate(
+    shift = slot(mlz, "multiLocalZscores")$shifts
+  ) %>% 
+  pivot_longer(
+    cols = -all_of("shift"), names_to = "region", values_to = "Z"
+  ) %>% 
+  mutate(
+    region = case_when(
+      region %in% names(regions) ~ regions[region],
+      TRUE ~ region
+    ) %>% 
+      factor(all_regions),
+    Z = Z / sqrt(length(consensus_peaks))
+  ) 
+heat_col <- c(
+  rev(RColorBrewer::brewer.pal(9, "PuBuGn")),
+  RColorBrewer::brewer.pal(9, "YlOrRd")
+)
+```
+
+
+In addition to enrichment of pathways, the consensus peaks were assessed for their relationship to the pre-defined gene-regions`r ifelse(has_features, " and the supplied external features.", ".")`.
+The package `regioneReloaded` [@Malinverni2023-ee] was used, which uses a permutation-based strategy to determine the expected overlap between a random region-set and the regions of interest.
+This effectively defines a viable H~0~ against which the observed number of overlaps can be tested.
+Using the Central Limit Theorem, the *normalised Z-scores* returned can be expected to to follow an approximate $\mathcal{N}(0,1)$ distribution, and these are used to regenerate adjusted p-values, as a more conservative alternative to those returned by the package.
+
+In addition to determining the strength of any overlaps with a given feature, distributions of shifted Z-scores can provide a measure of how these values are impacted by shifting the `r target` peaks within $\pm$ 5kb range around the detected peak.
+
+### Results Table
+
+```{r tbl-regioner}
+tbl_id <- "localz-res-table"
+tbl <- localz_df %>% 
+  dplyr::select(
+    region, mean_perm_test, n_overlaps, prop, enrichment,
+    norm_zscore, adj.p_value
+  ) %>% 
+  arrange(desc(abs(norm_zscore))) %>% 
+  mutate(
+    source = str_extract(region, ".+: ") %>% 
+      str_remove_all(": ") %>% 
+      str_replace_na(""),
+    region = str_remove_all(region, ".+: ")
+  ) %>% 
+  dplyr::select(source, region, everything()) %>% 
+  dplyr::select(where(\(x) !all(x == ""))) %>% 
+  dplyr::mutate(
+    across(any_of("source"), \(x) str_replace(x, "$^", "GRAVI")),
+    Sig = adj.p_value < 0.05
+  ) %>% 
+  reactable(
+    showPageSizeOptions = TRUE, filterable = TRUE,
+    columns = list(
+      source = colDef(
+        "Source", minWidth = 150,
+        filterInput = \(values, name) drop_filter(values, name, tbl_id)
+      ),
+      region = colDef(
+        "Region", minWidth = 150,
+        style = \(value) {
+          bg <- do.call(
+            "rgb", 
+            as.list(c(col2rgb(region_colours[[value]])[,1]/255, alpha = 0.7))
+          )
+          list(backgroundColor = bg)
+        },
+        filterInput = \(values, name) drop_filter(values, name, tbl_id)
+      ),
+      mean_perm_test = colDef("Expected Overlaps", format = comma_col),
+      n_overlaps = colDef("Overlapping Peaks", format = comma_col),
+      enrichment = colDef(
+        "log<sub>2</sub> Enrichment", format = colFormat(digits = 2),
+        html = TRUE,
+        style = \(value) list(color = ifelse(value > 0, "black", "red"))
+      ),
+      prop = colDef("% Total Peaks", format = percent_col),
+      norm_zscore = colDef(
+        "Z", format = colFormat(digits = 3),
+        style = \(value) list(color = ifelse(value > 0, "black", "red"))
+      ),
+      adj.p_value = colDef(
+        glue("p<sub>{enrich_params$adj}</sub>"), html = TRUE,
+        cell = \(value) sprint_pval(value),
+        style = \(value) {
+          text_colour <- ifelse(
+            value < regioner_params$alpha,
+            "black", colours$direction[["unchanged"]]
+          )
+          list(color = text_colour)
+        }
+      ),
+      Sig = colDef(
+        show = FALSE,
+        filterMethod = JS("function(rows, columnId, filterValue) {
+          if (filterValue === true) {
+            return rows.filter(function(row) {
+              const OnlySignificant = row.values[columnId]
+              return OnlySignificant
+            })
+          }
+          return rows
+        }")
+      )
+    )[colnames(.)],
+    elementId = tbl_id
+  )
+cp <- htmltools::em(
+  glue(
+    "
+    Results for association between the {comma(length(consensus_peaks))} 
+    {target} consensus peaks and the pre-defined 
+    genomic regions{ifelse(has_features, ' and the supplied external features.', '.')}
+    Expected overlaps are those obtained through random resampling of the genome
+    to match the consensus peaks. Enrichment is given taking log2 of 
+    the ratio between observed and expected overlapping peaks.
+    "
+  )
+)
+tl <- tagList(
+  htmltools::tags$caption(cp),  
+  tags$button(
+    tagList(fontawesome::fa("download"), "Download as CSV"),
+    onclick = glue(
+      "Reactable.downloadDataCSV('{tbl_id}', 'shared_localz_res.csv')"
+    )
+  ),
+  tags$button(
+    "Clear All Filters",
+    onclick = glue("Reactable.setAllFilters('{tbl_id}', [])")
+  ),
+  tags$label(
+    tags$input(
+      type = "checkbox", 
+      onclick = glue("Reactable.setFilter('{tbl_id}', 'Sig', event.target.checked)")
+    ),
+    "Only show significant associations"
+  ),
+  tbl
+)
+htmltools::browsable(tl)
+```
+
+### Z-Score Heatmap
+
+```{r zscore-heatmap, fig.cap = glue("*Normalised Z-scores showing the effect of shifting the subset of changed {target} peaks within a $\\pm$ {slot(mlz, 'parameters')$window / 1e3}kb window around the existing peaks.*")}
+shifted_z %>% 
+  arrange(abs(shift), Z) %>% 
+  mutate(
+    region = fct_inorder(as.character(region)),
+    source = ifelse(region %in% regions, "Region", "Feature")
+  ) %>% 
+  ggplot(aes(shift, fct_rev(region), fill = Z)) +
+  geom_raster() +
+  facet_grid(rows = vars(source), scales = "free", space = "free") +
+  scale_x_continuous(
+    expand = rep_len(0, 4), labels = \(x) x / 1e3, name = "Shift (kb)"
+  ) +
+  scale_y_discrete(expand = rep_len(0, 4), name = NULL) +
+  scale_fill_gradientn(
+    colours = heat_col,
+    limits = c(-1.05, 1.05) * max(abs(shifted_z$Z))
+  )
+```
+
+
+## Motif Analysis
+
+```{r load-motif-res}
+bs_genome <- get(bs_pkg)
+fw_peaks <- resize(
+  consensus_peaks, width = motif_params$peak_width, fix = "center"
+)
+genome(fw_peaks) <- ucsc$build
+fw_seq <- getSeq(bs_genome, fw_peaks)
+motif_adj <- match.arg(motif_params$adj, p.adjust.methods)
+motif_list <- file.path(all_paths$annotation, "motif_list.rds") %>% 
+  read_rds() %>% 
+  to_df %>% 
+  as_tibble()
+motif_uri <- file.path(all_paths$annotation, "motif_uri.rds") %>% 
+  read_rds()
+motif_pos_res <- all_paths$peaks %>%
+  file.path("{target}", "{target}_motif_position.tsv.gz") %>% 
+  glue() %>% 
+  read_tsv() %>% 
+  dplyr::select(-fdr) %>% 
+  mutate(adj_p = p.adjust(p, motif_adj))
+n_pos <- sum(motif_pos_res$adj_p < motif_params$alpha)
+motif_enrich_res <- all_paths$peaks %>% 
+  file.path("{target}", "{target}_motif_enrichment.tsv.gz") %>%
+  glue() %>% 
+  read_tsv() %>% 
+  dplyr::select(-fdr) %>% 
+  mutate(adj_p = p.adjust(p, motif_adj))
+n_enrich <- sum(
+  motif_enrich_res$adj_p < motif_params$alpha & motif_enrich_res$Z > 0
+)
+```
+
+Using the motifs defined during preparation, testing was performed for 1) enrichment above background and 2) any positional bias within the tested sequences.
+For this step peaks were set to a fixed width of `r motif_params$peak_width`bp, with sequences taken from these regions.
+
+### Motif Enrichment {.tabset}
+
+A simple enrichment analysis was performed by selecting a set of `r comma(motif_enrich_res$sequences[[1]] * motif_enrich_res$n_iter[[1]])` *background sequences* matched by genomic regions to the `r comma(motif_enrich_res$sequences[[1]])` *test sequences*.
+This gave a set of genomically matched control sequences to gauge enrichment by.
+Analysis was performed using the `motifTestR` package and the `r motif_params$model` model.
+
+Whilst statistical testing was two-sided, only enriched motifs (i.e. observed > expected) are shown in the results below, with `r n_enrich` of the `r comma(nrow(motif_list))` included motifs matching the criteria for being considered as enriched.
+
+`r if (n_enrich > 0) "#### Enrichment Table"`
+
+```{r tbl-res-enrich, eval = n_enrich > 0, echo = n_enrich > 0}
+tbl <- motif_enrich_res %>%
+  arrange(p) %>% 
+  dplyr::filter(adj_p < motif_params$alpha, Z > 0) %>% 
+  mutate(cluster = fct_inorder(as.character(cluster))) %>% 
+  dplyr::select(
+    cluster, ends_with("name"), Z, p, adj_p, matches, expected, enrichment
+  ) %>% 
+  mutate(
+    PWM = lapply(altname, \(x) motif_uri[[x]])
+  ) %>% 
+  reactable(
+    groupBy = "cluster",
+    showPageSizeOptions = TRUE, filterable = TRUE,
+    theme = reactableTheme(style = list(fontSize = 12)),
+    defaultSorted = "adj_p", defaultSortOrder = "asc",
+    columns = list(
+      cluster = colDef("Cluster", maxWidth = 70),
+      altname = colDef(
+        "Motif", minWidth = 180, aggregate = "unique",
+        style = list(borderLeft = "1px solid rgba(0, 0, 0, 0.1)")
+      ),
+      name = colDef(
+        "Name", minWidth = 120, aggregate = "unique",
+        style = list(borderRight = "1px solid rgba(0, 0, 0, 0.1)")
+      ),
+      matches = colDef(
+        "Total", maxWidth = 60, format = comma_col, aggregate = "max",
+        filterMethod = js_greater
+      ),
+      expected = colDef(
+        "Expected", maxWidth = 80, format = comma_col, aggregate = "max",
+        filterMethod = js_greater
+      ),
+      enrichment = colDef(
+        "Enrichment", maxWidth = 90, format = colFormat(digits = 3),
+        aggregate = "max", filterMethod = js_greater,
+        style = list(borderRight = "1px solid rgba(0, 0, 0, 0.1)")
+      ),
+      Z = colDef(
+        maxWidth = 60, format = colFormat(digits = 2), aggregate = "max",
+        filterMethod = js_greater
+      ),
+      p = colDef(show = FALSE),
+      adj_p = colDef(
+        glue("p<sub>{motif_adj}</sub>"), html = TRUE, maxWidth = 70,
+        cell = \(value) sprint_pval(value), aggregate = "min",
+        format = colFormat(digits = 3), filterMethod = js_less
+      ),
+      PWM = colDef(
+        name = "IC Matrix", minWidth = 180, filterable = FALSE,
+        cell = function(value) tags$img(src = value, height = '80px')
+      )
+    ),
+    elementId = "motif-enrich-table"
+  )
+cp <- htmltools::em(
+  glue(
+    "All {n_enrich} motifs considered as enriched relative to the background set
+    of sequences, using the {motif_params$model} model and an adjusted 
+    p-value ({motif_adj}) < {motif_params$alpha} as the criteria for 
+    significance. Motifs are grouped by clusters formed earlier, with all motifs
+    visible by clicking the arrow to the arbitrary cluster identifier. All 
+    columns are searchable and filterable."
+  )
+)
+tl <- tagList(
+  htmltools::tags$caption(cp),  
+  tags$button(
+    tagList(fontawesome::fa("download"), "Download as CSV"),
+    onclick = glue(
+      "Reactable.downloadDataCSV('motif-enrich-table', '{target}_motif_enrich_res.csv')"
+    )
+  ),
+  tags$button(
+    "Expand/Collapse All",
+    onclick = "Reactable.toggleAllRowsExpanded('motif-enrich-table')"
+  ),
+  tags$button(
+    "Clear All Filters",
+    onclick = "Reactable.setAllFilters('motif-enrich-table', [])"
+  ),
+  tbl
+)
+htmltools::browsable(tl)
+```
+
+`r if (n_enrich > 1) "#### Comparison of Motif Co-Occurrence"`
+
+```{r enrich-corrplot, echo = n_enrich > 1, fig.cap = glue("*The top {length(top_enrich)} motifs ranked for enrichment were compared to each other using correlations derived from simple presence/absence calls. Highly correlated motifs may indicate similarity between TFBMs and the same sequence match being identified. Motifs detected in all sequences were excluded after the initial selction and as such, fewer than the selected {length(top_enrich)} motifs may be shown*")}
+if (n_enrich > 1) {
+  top_enrich <- motif_enrich_res %>%
+    dplyr::filter(Z > 0, adj_p < motif_params$alpha) %>% 
+    dplyr::slice(1:20) %>% 
+    pull("altname")
+  cor_mat <- motif_list %>% 
+    dplyr::filter(name %in% top_enrich) %>% 
+    to_list() %>% 
+    getPwmMatches(fw_seq, mc.cores = threads) %>% 
+    lapply(\(x) tibble(seq = unique(x$seq))) %>% 
+    bind_rows(.id = "altname") %>%
+    distinct(altname, seq) %>% 
+    left_join(
+      dplyr::select(motif_enrich_res, altname, name), by = "altname"
+    ) %>% 
+    mutate(detected = TRUE) %>% 
+    dplyr::select(seq, altname, detected) %>% 
+    pivot_wider(
+      names_from = "altname", values_from = "detected", values_fill = FALSE
+    ) %>% 
+    dplyr::select(-seq) %>% 
+    dplyr::select(where(\(x) mean(x) < 1 & mean(x) > 0))
+  if (ncol(cor_mat) < 2) {
+    message("Too few motifs with variable matches to compute correlations.")
+    return(invisible(NULL))
+  }
+  cor_mat <- cor(cor_mat, method = "spearman")
+  hc <- hclust(dist(1 - cor_mat), method = "ward.D2")
+  dend <- ggdendro::dendro_data(as.dendrogram(hc))
+  levels <- dend$labels$label
+  ym <- max(dend$segments$xend)
+  dend_aes <- aes(yend, xend, xend = y, yend = x)
+  dend_plot <- ggplot(dend$segments) +
+    geom_segment(dend_aes) + 
+    scale_x_reverse(expand = expansion(0)) + 
+    scale_y_reverse(limits = c(ym, 0) + 0.5, expand = expansion(0)) +
+    labs(x = "", y = c()) + 
+    theme_minimal() + 
+    theme(
+      panel.grid = element_blank(), 
+      axis.text = element_blank(), axis.ticks = element_blank(), 
+      plot.margin = unit(c(5.5, 0, 5.5, 5.5), "points")
+    )
+  p <- cor_mat %>% 
+    as_tibble(rownames = "m1") %>% 
+    pivot_longer(cols = all_of(.$m1), names_to = "m2", values_to = "cor") %>% 
+    mutate(across(starts_with("m"), \(x) factor(x, levels = levels))) %>% 
+    dplyr::filter(m1 != m2) %>% 
+    ggplot(aes(m1, fct_rev(m2))) +
+    geom_point(aes(size = abs(cor), colour = cor, alpha = abs(cor))) +
+    geom_text(
+      aes(label = round(cor*100, 0), alpha = abs(cor)), show.legend = FALSE
+    ) +
+    scale_size(range = c(0, 10), guide = "none") +
+    scale_alpha(range = c(0, 1), guide = "none") +
+    scale_colour_gradient2(
+      low = colours$direction[["decreased"]], 
+      high = colours$direction[["increased"]],
+      limits = c(-1, 1), labels = percent_format(suffix = "")
+    ) +
+    scale_x_discrete(position = "top") +
+    labs(x = NULL, y = NULL, colour = expr(paste(rho))) +
+    theme(
+      panel.grid = element_blank(), 
+      axis.text.x.top = element_text(angle = 90, hjust = 0, vjust = 0.5)
+    )
+  dend_plot + p + plot_layout(widths = c(0.1, 0.9), axes = "collect")
+}
+```
+
+### Positional Bias {.tabset}
+
+```{r get-top-pos, eval = n_pos > 0, echo = n_pos > 0}
+top_pos <- motif_pos_res %>% 
+  dplyr::filter(adj_p < motif_params$alpha) %>% 
+  dplyr::filter(matches_in_region == max(matches_in_region), .by = cluster) %>% 
+  dplyr::slice(1:9) %>% 
+  dplyr::select(altname, name, cluster)
+clust_names <- motif_pos_res %>% 
+  dplyr::filter(
+    adj_p < motif_params$alpha,
+    cluster %in% top_pos$cluster
+  ) %>% 
+  arrange(desc(matches_in_region)) %>% 
+  summarise(
+    altname = altname[[1]], .by = cluster,
+    name = paste(unique(name), collapse = "/")
+  ) %>% 
+  mutate(name = setNames(name, altname)) %>% 
+  pull(name)
+```
+
+Positional bias was tested using the package `motifTestR`, bin-sizes of `r motif_params$binwidth`bp and testing `r ifelse(motif_params$abs, "distance from sequence centres", "position either side of the sequence centres")`.
+Any motifs which matched fewer than `r percent(motif_params$ignore_below)` of sequences were not tested for any positional bias.
+
+Using an adjusted p-value (`r motif_adj`) less than `r motif_params$alpha` to be considered as significant, `r n_pos` motifs were considered as showing any type of positional bias.
+
+It should also be noted that this type of analysis is agnostic to the number of matches found for a TFBM, and only assesses any bias within the distribution of matches.
+
+`r if (n_pos > 0) "#### Results Table"`
+
+```{r tbl-res-pos, eval = n_pos > 0, echo = n_pos > 0}
+tbl <- motif_pos_res %>%
+  dplyr::filter(adj_p < motif_params$alpha) %>% 
+  mutate(cluster = fct_inorder(as.character(cluster))) %>% 
+  dplyr::select(
+    cluster, contains("name"), ends_with("p"), start, end, centre, width,
+    contains("total"), matches_in_region, starts_with("e"), 
+  ) %>% 
+  mutate(
+    PWM = lapply(altname, \(x) motif_uri[[x]])
+  ) %>% 
+  reactable(
+    groupBy = "cluster", showPageSizeOptions = TRUE, filterable = TRUE,
+    columns = list(
+      cluster = colDef(maxWidth = 60),
+      name = colDef("Name", aggregate = "unique", maxWidth = 80),
+      altname = colDef("Motif", aggregate = "unique", minWidth = 180),
+      start = colDef(
+        "Start", aggregate = "min", maxWidth = 50,
+        filterMethod = js_greater
+      ),
+      end = colDef(
+        "End", aggregate = "max", maxWidth = 50, 
+        filterMethod = js_greater
+      ),
+      centre = colDef(
+        "Centre", aggregate = "median", maxWidth = 60, show = FALSE
+      ),
+      width = colDef(
+        "Width", aggregate = "median", maxWidth = 60, 
+        filterMethod = js_less
+      ),
+      total_matches = colDef(
+        "Total", aggregate = "max", maxWidth = 60, format = comma_col,
+        filterMethod = js_greater
+      ),
+      matches_in_region = colDef(
+        "Region", aggregate = "max", maxWidth = 60, 
+        filterMethod = js_greater
+      ),
+      expected = colDef(
+        "Expected", aggregate = "max", maxWidth = 75, format = comma_col,
+        filterMethod = js_greater
+      ),
+      enrichment = colDef(
+        "Region Enrichment", aggregate = "max", format = colFormat(digits = 2),
+        maxWidth = 90, filterMethod = js_greater
+      ),
+      prop_total = colDef(
+        "% In Region", aggregate = "max", format = percent_col, maxWidth = 60,
+        filterMethod = js_greater
+      ),
+      p = colDef(show = FALSE),
+      adj_p = colDef(
+        glue("p<sub>{motif_adj}</sub>"), html = TRUE, maxWidth = 70,
+        cell = \(value) sprint_pval(value), format = colFormat(digits = 3),
+        aggregate = "min", filterMethod = js_less
+      ),
+      PWM = colDef(
+        name = "IC Matrix", minWidth = 180, filterable = FALSE,
+        cell = function(value) tags$img(src = value, height = '80px')
+      )
+    ),
+    columnGroups = list(
+      colGroup(
+        name = "Matches", 
+        columns = c(
+          "total_matches", "prop_total", "matches_in_region", "expected",
+          "enrichment"
+        )
+      ),
+      colGroup(
+        name = "Positional Bias", 
+        columns = c("start", "end", "centre", "width")
+      )
+    ),
+    defaultSorted = "adj_p", defaultSortOrder = "asc",
+    theme = reactableTheme(style = list(fontSize = 12)),
+    elementId = "motif-pos-table"
+  )
+cp <- htmltools::em(
+  glue(
+    "
+    All {sum(motif_pos_res$adj_p < motif_params$alpha)} TFBMs found to show
+    positional bias using an adjusted p-value ({motif_adj}) below
+    {motif_params$alpha} as the criteria for significance. Highly 
+    similar motifs were clustered during preparation and are grouped accordingly.
+    Clicking the arrow next to the arbitrary cluster id will reveal full details
+    for all motifs within the cluster which were found to be significant, 
+    including the sequence logo showing information content (ICM).
+    "
+  )
+)
+tl <- tagList(
+  htmltools::tags$caption(cp),  
+  tags$button(
+    tagList(fontawesome::fa("download"), "Download as CSV"),
+    onclick = glue(
+      "Reactable.downloadDataCSV('motif-pos-table', '{target}_position_res.csv')"
+    )
+  ),
+  tags$button(
+    "Expand/Collapse All",
+    onclick = "Reactable.toggleAllRowsExpanded('motif-pos-table')"
+  ),
+  tags$button(
+    "Clear All Filters",
+    onclick = "Reactable.setAllFilters('motif-pos-table', [])"
+  ),
+  tbl
+)
+htmltools::browsable(tl)
+```
+
+`r if (n_pos > 0) "#### Total Matches"`
+
+```{r plot-total-pos-matches, eval = n_pos > 0, echo = n_pos > 0, fig.cap = glue("*All best matches by their distance from the sequence centre, without binning by position. Black lines represent the loess curve through all matches. The motif with the most matches within the enriched region is shown for each cluster, with the other motifs within the cluster indicated below in brackets.*")}
+lb <- glue("{names(clust_names)}\n({clust_names})") %>% 
+  setNames(names(clust_names))
+top_matches_df <- motif_list %>% 
+  dplyr::filter(altname %in% top_pos$altname) %>% 
+  mutate(fct = factor(altname, levels = top_pos$altname)) %>% 
+  arrange(fct)
+top_matches <- NULL
+if (nrow(top_matches_df) > 0) {
+  top_matches <- top_matches_df %>% 
+    to_list() %>% 
+    getPwmMatches(
+      fw_seq, abs = motif_params$abs, best_only = TRUE, mc.cores = threads
+    )
+}
+if (!is.null(top_matches)) {
+  top_matches %>% 
+    plotMatchPos(
+      geom = "point", abs = motif_params$abs, use_totals = TRUE,
+      binwidth = 1
+    ) +
+    geom_smooth(se = FALSE, colour = "black", linewidth = 1/2, method = 'loess') +
+    facet_wrap(~name, labeller = as_labeller(lb)) +
+    theme(legend.position = "none") +
+    labs(x = "Distance From Sequence Centre", y = "Total Matches")
+}
+```
+
+`r if (n_pos > 0) "#### Proportional Match Distributions"`
+
+```{r plot-smoothed-pos, eval = n_pos > 0, echo = n_pos > 0, fig.height = 0.75 * fh, fig.cap = glue("*Best matches for the representative motif within each cluster, shown as (A) proportions and (B) as a cumulative distribution*")}
+if (!is.null(top_matches)) {
+  A <- top_matches %>% 
+    plotMatchPos(
+      se = FALSE, abs = motif_params$abs, linewidth = 1/2,
+      binwidth = motif_params$binwidth / 2
+    ) +
+    labs(
+      x = "Distance From Centre", y = "Proportion", colour = "Motifs In Cluster"
+    ) +
+    theme(legend.position = "none")
+  B <- top_matches %>% 
+    plotMatchPos(
+      type = "cdf", geom = "line", abs = motif_params$abs,
+      linewidth = 1 / 2, binwidth = 1
+    ) +
+    labs(x = "Distance From Centre", y = "Proportion", colour = "Representative Motif")
+  print(A + B + plot_layout(guides = "collect"))
+}
+```
+
+`r if (n_pos > 0) "#### Match Heatmap"`
+
+```{r heatmap-pos, echo = n_pos > 0, fig.cap = glue("*The top-ranked motifs by positional bias showing the total number of matches within each bin. Motifs are clustered by similarity of totals within this figure when more than two are being displayed. A maximum of 25 motifs are shown in this figure.*")}
+if (n_pos > 0) {
+  top_pos_hm <- motif_pos_res %>% 
+    dplyr::filter(adj_p < motif_params$alpha) %>% 
+    dplyr::slice(1:25) %>% 
+    pull(altname)
+  hm_motifs <- motif_list %>% dplyr::filter(altname %in% top_pos_hm)
+  if (nrow(hm_motifs) > 0) {
+    hm_motifs %>% 
+      to_list() %>% 
+      getPwmMatches(
+        fw_seq, abs = motif_params$abs, best_only = TRUE, mc.cores = threads
+      ) %>% 
+      plotMatchPos(
+        abs = motif_params$abs, type = "heatmap", cluster = n_pos > 2,
+        use_totals = TRUE,
+        binwidth = motif_params$binwidth 
+      ) + 
+      labs(x = "Bin", fill = "Total\n Matches")
+  }
+}
+```
+
+## Data Export
+
+```{r export, results='hide', echo=FALSE}
+out_path <- file.path("output", "results", "signal_summary", target)
+if (!dir.exists(out_path)) dir.create(out_path, recursive = TRUE)
+all_out <- list(
+  enrichment = file.path(out_path, glue("{target}_enrichment.csv")),
+  localz = file.path(out_path, glue("{target}_localz.csv")),
+  renv = file.path(
+    "output", "envs", glue("{target}_signal_summary.RData")
+  )
+)
+enrich_df %>% 
+  mutate(gene_id = map_chr(gene_id, paste, collapse = "; ")) %>% 
+  write_csv(here::here(all_out$enrichment))
+write_csv(localz_df, here::here(all_out$localz))
+save.image(here::here(all_out$renv))
+```
+
+Files exported during preparation of this document are:
+
+`r pander(all_out)`
+
+```{r existing_in, echo = FALSE}
+existing_in <- list(
+  motif_pos_res = file.path(
+    all_paths$peaks, "{target}", "{target}_motif_position.tsv.gz"
+  ),
+  motif_enrich_res = file.path(
+    all_paths$peaks, "{target}", "{target}_motif_enrichment.tsv.gz"
+  )
+)
+```
+
+Existing results obtained during previous steps in the workflow and presented here are:
+
+`r pander(existing_in)`
+
+## References
+
+<div id="refs"></div>
+
+<br>
+<button type="button" class="btn btn-default btn-sessioninfo" data-toggle="collapse" data-target="#sessioninfo" style="display: block;">
+<span class="glyphicon glyphicon-info-sign" aria-hidden="true"></span> Session information
+</button>
+</p>
+<div id="sessioninfo" class="collapse">
+```{r session-info, echo=FALSE}
+pander::pander(sessionInfo())
+```
+</div>
