@@ -161,3 +161,28 @@ if (nrow(top_matches) == 0) {
   message("No motifs in motif_list matched top_pos$altname — skipping positional plots.")
   knitr::knit_exit()
 }
+
+2026-Jul-17 11:47:18     Done 
+[Fri Jul 17 11:47:18 2026]
+Finished jobid: 24 (Rule: create_signal_summary_rmd)
+40 of 56 steps (71%) done
+Exiting because a job execution failed. Look below for error messages
+[Fri Jul 17 11:47:18 2026]
+Error in rule create_site_yaml:
+    message: None
+    jobid: 22
+    input: output/checks/args.chk, output/checks/r-packages.chk, config/samples.tsv, workflow/scripts/create_site_yaml.R, config/rmarkdown.yml
+    output: analysis/_site.yml
+    log: workflow/logs/create_rmd/site_yaml.log (check log file(s) for error details)
+    conda-env: /home/a1242191/miniconda3/envs/8ae18d6a308beaf4fed1548ae949d4e1_
+[Fri Jul 17 11:47:18 2026]
+Error in rule filter_merged_peaks:
+    message: None
+    jobid: 75
+    input: output/checks/args.chk, output/annotations/blacklist.rds, output/greylist/greylists.rds, output/macs2/AR/AR_Control_merged_peaks.narrowPeak, output/macs2/AR/AR_qc_samples.tsv, output/macs2/AR_Veh_1/AR_Veh_1_peaks.narrowPeak, output/macs2/AR_Veh_3/AR_Veh_3_peaks.narrowPeak, output/macs2/AR_Veh_2/AR_Veh_2_peaks.narrowPeak, output/annotations/seqinfo.rds
+    output: output/peak_analysis/AR/AR_Control_filtered_peaks.narrowPeak
+    log: workflow/logs/filter_merged_peaks/AR_Control.log (check log file(s) for error details)
+    conda-env: /home/a1242191/miniconda3/envs/8ae18d6a308beaf4fed1548ae949d4e1_
+Complete log(s): /scratchdata1/groups/phoenix-hpc-drmcrl/gravi/GRAVI/.snakemake/log/2026-07-17T100831.724490.snakemake.log
+WorkflowError:
+At least one job did not complete successfully.
